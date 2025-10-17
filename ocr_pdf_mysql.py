@@ -6,7 +6,8 @@ import numpy as np
 import re
 # --- CONFIGURACIÓN ---
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-POPPLER_PATH = r"C:\Program Files\poppler-24.08.0\bin"
+# POPPLER_PATH = r"C:\Program Files\poppler-24.08.0\bin"
+POPPLER_PATH = r"C:\Program Files\poppler-24.08.0\Library\bin"
 
 # --- FUNCIÓN: OCR + PREPROCESAMIENTO ---
 def extraer_texto_ocr(pdf_path, page_number=1):
@@ -132,9 +133,48 @@ def parsear_bill_to_ship_to_v4(texto, num_lineas=4):
                     # Solo una columna, asumimos que está mal alineado
                     bill_to.append(partes[0].strip())
     return {
-        "bill_to": "\n".join(bill_to).strip() if bill_to else None,
-        "ship_to": "\n".join(ship_to).strip() if ship_to else None
+        "Bill to": "\n".join(bill_to).strip() if bill_to else None,
+        "Ship to": "\n".join(ship_to).strip() if ship_to else None
     }
+
+def extraer_ship_to_bill_to_lineas_separadas(texto):
+    lineas = [l.strip() for l in texto.splitlines() if l.strip() != ""]
+
+    ship_to_idx = None
+    bill_to_idx = None
+
+    # Buscar índices donde aparecen "Ship To:" y "Bill To:"
+    for i, linea in enumerate(lineas):
+        if "Ship To:" in linea:
+            ship_to_idx = i
+        if "Bill To:" in linea:
+            bill_to_idx = i
+
+    ship_to_info = []
+    bill_to_info = []
+
+    # Capturar las 3 líneas siguientes a Ship To (empresa, dirección, ciudad)
+    if ship_to_idx is not None:
+        ship_to_info = lineas[ship_to_idx+1:ship_to_idx+4]
+
+    # Capturar las 3 líneas siguientes a Bill To (empresa, dirección, ciudad)
+    if bill_to_idx is not None:
+        bill_to_info = lineas[bill_to_idx+1:bill_to_idx+4]
+
+    # Formar diccionarios con protección de índices
+    ship_to_dict = {
+        "company": ship_to_info[0] if len(ship_to_info) > 0 else "",
+        "address_line_1": ship_to_info[1] if len(ship_to_info) > 1 else "",
+        "city_state_zip": ship_to_info[2] if len(ship_to_info) > 2 else ""
+    }
+
+    bill_to_dict = {
+        "company": bill_to_info[0] if len(bill_to_info) > 0 else "",
+        "address_line_2": bill_to_info[1] if len(bill_to_info) > 1 else "",
+        "city_state_zip": bill_to_info[2] if len(bill_to_info) > 2 else ""
+    }
+
+    return {"Ship To": ship_to_dict, "Bill To": bill_to_dict}
 
 def extraer_direcciones(texto):
     lineas = texto.splitlines()
@@ -214,6 +254,236 @@ def extraer_direcciones_columnas(texto):
 
     return {"ship_to": ship_to, "bill_to": bill_to}
 
+def extraer_ship_bill_columnar(texto, num_lineas=3):
+    lineas = texto.splitlines()
+    ship_to = []
+    bill_to = []
+
+    capturando = False
+    for i, linea in enumerate(lineas):
+        if "Ship To" in linea and "Bill To" in linea:
+            # Inicia la captura desde aquí
+            capturando = True
+            continue
+
+        if capturando:
+            if len(ship_to) >= num_lineas and len(bill_to) >= num_lineas:
+                break  # Ya tenemos suficiente info
+
+            # Separar por múltiples espacios o tabulaciones
+            partes = re.split(r'\s{2,}|\t+', linea.strip())
+
+            if len(partes) == 2:
+                # Dependiendo del orden visual, invertimos
+                bill_to.append(partes[0].strip())
+                ship_to.append(partes[1].strip())
+            elif len(partes) == 1:
+                # Si sólo hay una parte, asumimos que está alineada
+                ship_to.append(partes[0].strip())
+
+    return {
+        "Ship To": "\n".join(ship_to),
+        "Bill To": "\n".join(bill_to)
+    }
+
+def extraer_direcciones_ship_bill(texto):
+    lineas = texto.splitlines()
+    ship_to = []
+    bill_to = []
+
+    capturando = False
+    lineas_direccion = []
+
+    for i, linea in enumerate(lineas):
+        if "Ship To" in linea and "Bill To" in linea:
+            capturando = True
+            continue
+        if capturando:
+            # Cortamos cuando llegamos a una línea vacía o de campos no relacionados
+            if linea.strip() == "" or "Incoterm" in linea:
+                break
+            lineas_direccion.append(linea.strip())
+
+    # Procesamos las líneas
+    for linea in lineas_direccion:
+        partes = re.split(r'\s{2,}', linea.strip())
+        if len(partes) == 2:
+            bill_to.append(partes[0].strip())
+            ship_to.append(partes[1].strip())
+        elif len(partes) == 1:
+            # Analizamos si hay ciudad y estado para determinar
+            if any(c in partes[0] for c in ["TX", "GTO", "LA"]):
+                if "Magnolia" in partes[0]:
+                    bill_to.append(partes[0].strip())
+                elif "Grapevine" in partes[0]:
+                    ship_to.append(partes[0].strip())
+            elif "Arrow" in partes[0]:
+                bill_to.append(partes[0].strip())
+            elif "Plasticos" in partes[0] or "BOP" in partes[0]:
+                ship_to.append(partes[0].strip())
+            elif re.search(r"\d{5}", partes[0]):
+                # línea con código postal → depende de contexto
+                if len(bill_to) < 3:
+                    bill_to.append(partes[0].strip())
+                else:
+                    ship_to.append(partes[0].strip())
+
+    return {
+        "Ship To": {
+            "company": ship_to[0] if len(ship_to) > 0 else "",
+            "address_line_1": ship_to[1] if len(ship_to) > 1 else "",
+            "city_state_zip": ship_to[2] if len(ship_to) > 2 else ""
+        },
+        "Bill To": {
+            "company": bill_to[0] if len(bill_to) > 0 else "",
+            "address_line_2": bill_to[1] if len(bill_to) > 1 else "",
+            "city_state_zip": bill_to[2] if len(bill_to) > 2 else ""
+        }
+    }
+
+# si funciona parcialmente
+def extraer_ship_to_bill_to(texto):
+    lineas = texto.splitlines()
+
+    ship_to = []
+    bill_to = []
+
+    capturando = False
+    buffer_lineas = []
+
+    for linea in lineas:
+        linea = linea.strip()
+
+        # Detectar la línea que contiene "Ship To:" y "Bill To:"
+        if "Ship To" in linea and "Bill To" in linea:
+            capturando = True
+            continue
+
+        if capturando:
+            # Parar al encontrar líneas que no pertenecen a estas secciones
+            if linea == "" or linea.startswith("RFC:") or linea.startswith("Incoterm") or linea.startswith("ProductNo") or linea.startswith("Subtotal") or linea.startswith("TOTAL"):
+                break
+            buffer_lineas.append(linea)
+
+    # buffer_lineas ejemplo esperado:
+    # [
+    #  'Arrow Trading LLC.',
+    #  'Plasticos Adheribles del Bajio',
+    #  'oi BOP Intemational 28789 Hardin Store Rd. Suite 230',
+    #  '_| Grapevine, TX 76051 Magnolia, TX 77354'
+    # ]
+
+    # Procesar igual que antes:
+    if buffer_lineas:
+        bill_to.append(buffer_lineas[0])
+
+    if len(buffer_lineas) > 1:
+        ship_to.append(buffer_lineas[1])
+
+    if len(buffer_lineas) > 2:
+        linea_3 = buffer_lineas[2]
+        match = re.search(r'(\d+ .*Suite \d+)', linea_3)
+        if match:
+            bill_to_address = match.group(1)
+            ship_to_address = linea_3.replace(bill_to_address, "").strip()
+            ship_to.append(ship_to_address)
+            bill_to.append(bill_to_address)
+        else:
+            ship_to.append(linea_3)
+
+    if len(buffer_lineas) > 3:
+        linea_4 = buffer_lineas[3]
+        linea_4 = linea_4.replace("_|", "").strip()
+        if "Magnolia" in linea_4:
+            partes = linea_4.split("Magnolia")
+            ship_to_city = partes[0].strip()
+            bill_to_city = "Magnolia " + partes[1].strip()
+            ship_to.append(ship_to_city)
+            bill_to.append(bill_to_city)
+        else:
+            ship_to.append(linea_4)
+
+    ship_to_dict = {
+        "company": ship_to[0] if len(ship_to) > 0 else "",
+        "address_line_1": ship_to[1] if len(ship_to) > 1 else "",
+        "city_state_zip": ship_to[2] if len(ship_to) > 2 else ""
+    }
+
+    bill_to_dict = {
+        "company": bill_to[0] if len(bill_to) > 0 else "",
+        "address_line_2": bill_to[1] if len(bill_to) > 1 else "",
+        "city_state_zip": bill_to[2] if len(bill_to) > 2 else ""
+    }
+
+    return {"Ship To": ship_to_dict, "Bill To": bill_to_dict}
+
+def extraer_ship_to_bill_to_v1(texto):
+    lineas = [l.strip() for l in texto.splitlines() if l.strip() != ""]
+
+    ship_to = []
+    bill_to = []
+
+    capturando = False
+    buffer_lineas = []
+
+    for idx, linea in enumerate(lineas):
+        # Detectar la línea que contiene "Ship To:" y "Bill To:"
+        if re.search(r"Ship To.*Bill To", linea, re.IGNORECASE):
+            capturando = True
+            # Empezar a tomar desde la siguiente línea
+            for siguiente in lineas[idx+1:]:
+                # Parar si la línea es alguna clave de fin
+                if siguiente.startswith(("RFC:", "Incoterm", "ProductNo", "Subtotal", "TOTAL")):
+                    break
+                buffer_lineas.append(siguiente)
+            break
+
+    if len(buffer_lineas) < 4:
+        return {"Ship To": {}, "Bill To": {}}
+
+    # 0: Bill To Company
+    bill_to.append(buffer_lineas[0])
+
+    # 1: Ship To Company
+    ship_to.append(buffer_lineas[1])
+
+    # 2: Dirección (contiene números y suite)
+    linea_2 = buffer_lineas[2]
+    match_dir = re.search(r'(\d+ .*Suite \d+)', linea_2)
+    if match_dir:
+        bill_to_address = match_dir.group(1)
+        ship_to_address = linea_2.replace(bill_to_address, "").strip()
+        ship_to.append(ship_to_address)
+        bill_to.append(bill_to_address)
+    else:
+        ship_to.append(linea_2)
+        bill_to.append("")
+
+    # 3: Ciudad y estado mezclados
+    linea_3 = buffer_lineas[3].replace("_|", "").strip()
+    if "Magnolia" in linea_3:
+        partes = linea_3.split("Magnolia")
+        ship_to_city = partes[0].strip()
+        bill_to_city = "Magnolia " + partes[1].strip()
+        ship_to.append(ship_to_city)
+        bill_to.append(bill_to_city)
+    else:
+        ship_to.append(linea_3)
+        bill_to.append("")
+
+    ship_to_dict = {
+        "company": ship_to[0] if len(ship_to) > 0 else "",
+        "address_line_1": ship_to[1] if len(ship_to) > 1 else "",
+        "city_state_zip": ship_to[2] if len(ship_to) > 2 else ""
+    }
+
+    bill_to_dict = {
+        "company": bill_to[0] if len(bill_to) > 0 else "",
+        "address_line_2": bill_to[1] if len(bill_to) > 1 else "",
+        "city_state_zip": bill_to[2] if len(bill_to) > 2 else ""
+    }
+
+    return {"Ship To": ship_to_dict, "Bill To": bill_to_dict}
 # --- FUNCIÓN: EXTRAER PRODUCTOS ---
 def parsear_productos_fragmento(texto):
     productos = []
@@ -789,7 +1059,11 @@ def extraer_datos_factura(texto):
     Devuelve un diccionario con todos los datos extraídos.
     """
     datos_encabezado = parsear_encabezado_v3(texto)
-    # debug_encabezado_y_productos(texto)
+    billtoShipto = extraer_ship_to_bill_to_v1(texto)
+    print("bill to")
+    print(billtoShipto.get("Bill To"))
+    print("ship to")
+    print(billtoShipto.get("Ship To"))
     productos = extraer_productos_con_descripcion_detalle_v_combinado(texto)
     datos_terminos = parsear_terminos_regex_v2(texto)
     totales = extraer_totales(texto)
@@ -835,6 +1109,7 @@ def procesar_factura_pdf_v2(pdf_path):
 
     for p in range(1, num_paginas + 1):
         texto = extraer_texto_ocr(pdf_path, page_number=p)
+        # print(texto)
         # verificar si esta página parece contener datos válidos
         if contiene_datos_relevantes(texto):
             # si sí tiene datos, extraemos ahí
@@ -851,7 +1126,7 @@ def procesar_factura_pdf_v2(pdf_path):
     else:
         # si encontraste una válida, marca cuál fue
         datos_factura["pagina_detectada"] = p
-
+    print(texto)
     return datos_factura
 
 def contiene_datos_relevantes(texto):
@@ -879,39 +1154,39 @@ def contiene_datos_relevantes(texto):
     return any([tiene_invoice_no, tiene_invoice_date, tiene_so_no, tiene_terminos, tiene_productos])
 
 # --- USO PRINCIPAL ---
-pdf_path = r"C:\Users\obeli\Documents\admix_projects\python\pdf_reader\NO_PROCESABLE___25-08-27___16-50-44___T-.pdf"
+pdf_path = r"C:\Users\obeli\Documents\admix_projects\pdf_to_text_atc_parser\NO_PROCESABLE___25-08-27___16-50-44___T-.pdf"
 
 # Llamar a la nueva función que encapsula todo el proceso
 datos_factura = procesar_factura_pdf_v2(pdf_path)
 
-print("\n--- 🧾 DATOS DEL ENCABEZADO ---")
-if not any(datos_factura["encabezado"].values()):
-    print("No se encontraron datos del encabezado.")
-else:
-    for campo, valor in datos_factura["encabezado"].items():
-        print(f"  - {campo.replace('_', ' ').title()}: {valor}")
+# print("\n--- 🧾 DATOS DEL ENCABEZADO ---")
+# if not any(datos_factura["encabezado"].values()):
+#     print("No se encontraron datos del encabezado.")
+# else:
+#     for campo, valor in datos_factura["encabezado"].items():
+#         print(f"  - {campo.replace('_', ' ').title()}: {valor}")
 
-print("\n--- 🚚 TÉRMINOS DE ENVÍO ---")
-if not any(datos_factura["terminos"].values()):
-    print("No se encontraron datos de términos.")
-else:
-    for campo, valor in datos_factura["terminos"].items():
-        print(f"  - {campo.replace('_', ' ').title()}: {valor}")
+# print("\n--- 🚚 TÉRMINOS DE ENVÍO ---")
+# if not any(datos_factura["terminos"].values()):
+#     print("No se encontraron datos de términos.")
+# else:
+#     for campo, valor in datos_factura["terminos"].items():
+#         print(f"  - {campo.replace('_', ' ').title()}: {valor}")
 
-print("\n--- 📦 PRODUCTOS ---")
-if not datos_factura["productos"]:
-    print("No se encontraron productos.")
-else:
-    for p in datos_factura["productos"]:
-        print(f"  - Product No: {p['product_no']}")
-        print(f"  - Qty: {p['item_qty']}")
-        print(f"  - U/M: {p['u_m']}")
-        print(f"  - Description: {p['description']}")
-        print(f"  - Description Detail: {p['description_detail']}")
-        print(f"  - Price Each: {p['price_each']}")
-        print(f"  - Amount: {p['amount']}")
-        print("--------")
-print("\n--- 💰 SUBTOTAL Y TOTAL ---")
-print(f"Subtotal: {datos_factura['totales']['subtotal']}")
-print(f"Total: {datos_factura['totales']['total']}")   
+# print("\n--- 📦 PRODUCTOS ---")
+# if not datos_factura["productos"]:
+#     print("No se encontraron productos.")
+# else:
+#     for p in datos_factura["productos"]:
+#         print(f"  - Product No: {p['product_no']}")
+#         print(f"  - Qty: {p['item_qty']}")
+#         print(f"  - U/M: {p['u_m']}")
+#         print(f"  - Description: {p['description']}")
+#         print(f"  - Description Detail: {p['description_detail']}")
+#         print(f"  - Price Each: {p['price_each']}")
+#         print(f"  - Amount: {p['amount']}")
+#         print("--------")
+# print("\n--- 💰 SUBTOTAL Y TOTAL ---")
+# print(f"Subtotal: {datos_factura['totales']['subtotal']}")
+# print(f"Total: {datos_factura['totales']['total']}")   
   
