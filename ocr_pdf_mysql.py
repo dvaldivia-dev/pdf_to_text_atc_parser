@@ -1126,7 +1126,7 @@ def procesar_factura_pdf_v2(pdf_path):
     else:
         # si encontraste una válida, marca cuál fue
         datos_factura["pagina_detectada"] = p
-    print(texto)
+    # print(texto)
     return datos_factura
 
 def contiene_datos_relevantes(texto):
@@ -1154,39 +1154,42 @@ def contiene_datos_relevantes(texto):
     return any([tiene_invoice_no, tiene_invoice_date, tiene_so_no, tiene_terminos, tiene_productos])
 
 # --- USO PRINCIPAL ---
-pdf_path = r"C:\Users\obeli\Documents\admix_projects\pdf_to_text_atc_parser\NO_PROCESABLE___25-08-27___16-50-44___T-.pdf"
+# C:\Users\obeli\Documents\admix_projects\pdf_to_text_atc_parser\
+
+pdf_path = r"c:\Users\obeli\Documents\admix_projects\python\pdf_reader\pdfs\procesables\_.pdf"
+# r"C:\Users\obeli\Documents\admix_projects\python\pdf_reader\NO_PROCESABLE___25-08-22___15-32-18___A-.pdf"
 
 # Llamar a la nueva función que encapsula todo el proceso
 datos_factura = procesar_factura_pdf_v2(pdf_path)
 
-# print("\n--- 🧾 DATOS DEL ENCABEZADO ---")
-# if not any(datos_factura["encabezado"].values()):
-#     print("No se encontraron datos del encabezado.")
-# else:
-#     for campo, valor in datos_factura["encabezado"].items():
-#         print(f"  - {campo.replace('_', ' ').title()}: {valor}")
+print("\n--- 🧾 DATOS DEL ENCABEZADO ---")
+if not any(datos_factura["encabezado"].values()):
+    print("No se encontraron datos del encabezado.")
+else:
+    for campo, valor in datos_factura["encabezado"].items():
+        print(f"  - {campo.replace('_', ' ').title()}: {valor}")
 
-# print("\n--- 🚚 TÉRMINOS DE ENVÍO ---")
-# if not any(datos_factura["terminos"].values()):
-#     print("No se encontraron datos de términos.")
-# else:
-#     for campo, valor in datos_factura["terminos"].items():
-#         print(f"  - {campo.replace('_', ' ').title()}: {valor}")
+print("\n--- 🚚 TÉRMINOS DE ENVÍO ---")
+if not any(datos_factura["terminos"].values()):
+    print("No se encontraron datos de términos.")
+else:
+    for campo, valor in datos_factura["terminos"].items():
+        print(f"  - {campo.replace('_', ' ').title()}: {valor}")
 
-# print("\n--- 📦 PRODUCTOS ---")
-# if not datos_factura["productos"]:
-#     print("No se encontraron productos.")
-# else:
-#     for p in datos_factura["productos"]:
-#         print(f"  - Product No: {p['product_no']}")
-#         print(f"  - Qty: {p['item_qty']}")
-#         print(f"  - U/M: {p['u_m']}")
-#         print(f"  - Description: {p['description']}")
-#         print(f"  - Description Detail: {p['description_detail']}")
-#         print(f"  - Price Each: {p['price_each']}")
-#         print(f"  - Amount: {p['amount']}")
-#         print("--------")
-# print("\n--- 💰 SUBTOTAL Y TOTAL ---")
-# print(f"Subtotal: {datos_factura['totales']['subtotal']}")
-# print(f"Total: {datos_factura['totales']['total']}")   
+print("\n--- 📦 PRODUCTOS ---")
+if not datos_factura["productos"]:
+    print("No se encontraron productos.")
+else:
+    for p in datos_factura["productos"]:
+        print(f"  - Product No: {p['product_no']}")
+        print(f"  - Qty: {p['item_qty']}")
+        print(f"  - U/M: {p['u_m']}")
+        print(f"  - Description: {p['description']}")
+        print(f"  - Description Detail: {p['description_detail']}")
+        print(f"  - Price Each: {p['price_each']}")
+        print(f"  - Amount: {p['amount']}")
+        print("--------")
+print("\n--- 💰 SUBTOTAL Y TOTAL ---")
+print(f"Subtotal: {datos_factura['totales']['subtotal']}")
+print(f"Total: {datos_factura['totales']['total']}")   
   

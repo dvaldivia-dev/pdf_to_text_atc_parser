@@ -20,6 +20,73 @@ def _ocr_from_pdf(pdf_path, dpi=300, lang="eng"):
         text += pytesseract.image_to_string(img, lang=lang) + "\n"
     return text
 
+def extract_shipping_terms(text):
+    import re
+
+    pattern = re.compile(
+        # Encabezado: Incoterm... Method of Shipment
+        r"(?:Incoterm|lncoterm|lncotenn)\s*Payment\s*Terms\s*Ship\s*Date\s*Due\s*Date\s*Method\s*of\s*Shipment[ \r\n\t]*"
+        
+        # Incoterm: Se detiene justo antes de un 'Payment Terms' conocido.
+        r"(?P<incoterm>[A-Z0-9\s,.:/]+?)\s*" 
+        r"(?=(Net\s*\d+\s*Days|Prepaid|Collect|))" 
+
+        # Payment Terms: Captura el término de pago.
+        r"(?P<payment_terms>Net\s*\d+\s*Days|Prepaid|Collect|)\s*" 
+        r"[ \r\n\t]*"
+
+        # Ship Date (obligatoria en este contexto).
+        r"(?P<ship_date>\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{2,4})" 
+        r"[ \r\n\t]*" 
+
+        # Due Date (HACEMOS ESTE CAMPO OPCIONAL CON ?).
+        r"(?P<due_date>\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{2,4})?" 
+        r"[ \r\n\t]*" 
+
+        # Method of Shipment.
+        r"(?P<method>[A-Za-z\s,.]+?)"
+        r"(?:\s+Product No)", 
+
+        re.IGNORECASE | re.DOTALL
+    )
+
+    match = pattern.search(text)
+
+    if match:
+        incoterm = match.group("incoterm").strip() if match.group("incoterm") else None
+        payment_terms = match.group("payment_terms").strip() if match.group("payment_terms") else None
+        ship_date = match.group("ship_date").strip() if match.group("ship_date") else None
+        due_date = match.group("due_date").strip() if match.group("due_date") else None
+        method = match.group("method").strip() if match.group("method") else None
+
+        # 🔹 Limpieza de Incoterm
+        if incoterm and incoterm.endswith(':'):
+            incoterm = incoterm[:-1].strip()
+
+        # 🔹 Limpieza de Payment Terms
+        if not payment_terms:
+            payment_terms = None
+
+        # 🔹 Lógica de RAILCAR que tenías (aunque 'RAILCAR' ya debe ser el método)
+        if method and method.upper() == "LEON" and "RAILCAR" in text.upper():
+            method = "RAILCAR"
+        
+        return {
+            "Incoterm": incoterm,
+            "Payment Terms": payment_terms,
+            "Ship Date": ship_date,
+            "Due Date": due_date,
+            "Method of Shipment": method
+        }
+
+    return {
+        "Incoterm": None,
+        "Payment Terms": None,
+        "Ship Date": None,
+        "Due Date": None,
+        "Method of Shipment": None
+    }
+
 def extract_invoice_data(pdf_path):
     """
     Versión mejorada de extracción para encabezado, términos, direcciones,
@@ -176,71 +243,17 @@ def extract_invoice_data(pdf_path):
         if coa_match:
             data["Ship To"] = clean_address_block(coa_match.group(1).strip())
 
+        # ----------------------------------------------------------------------
+    # ---------- 4. EXTRAER INCOTERM, PAYMENT TERMS, FECHAS, METHOD (FINAL ROBUSTO) ----------
     # ----------------------------------------------------------------------
-    # ---------- 4. EXTRAER INCOTERM, PAYMENT TERMS, FECHAS, METHOD (Ajustado) ----------
-    # ----------------------------------------------------------------------
-    
-    # buscamos bloque de términos
-    terms_text_match = re.search(r"(?:lncotenn|Incotenn|Incoterm|Incotenn)\b(.{0,250})", full_text, re.I | re.DOTALL) # Aumentado el rango
-    terms_text = terms_text_match.group(1) if terms_text_match else full_text_one
 
-    # Incoterm: Buscamos DAP: o DAT: seguido por POINT (opcional) y la ubicación
-    m_incoterm = re.search(
-        r"(DAP|DAT)\s*POINT\s*[:\s]*([A-Za-z0-9,\s\.]+?)(?:Net\s*\d+|(?:\d{1,2}/\d{1,2}/\d{2,4})|RAILCAR|TRUCK|COMMON\s+CARRIER|Subtotal|TOTAL)", 
-        terms_text, 
-        re.I
-    )
-    # Si falla la búsqueda con POINT, probamos sin él (para el ejemplo anterior)
-    if not m_incoterm:
-        m_incoterm = re.search(
-            r"(DAP|DAT)\s*[:\s]*([A-Za-z0-9,\s\.]+?)(?:Net\s*\d+|(?:\d{1,2}/\d{1,2}/\d{2,4})|RAILCAR|TRUCK|COMMON\s+CARRIER|Subtotal|TOTAL)", 
-            terms_text, 
-            re.I
-        )
-        
-    if m_incoterm:
-        # Si se encontró con "POINT", group(2) es "LAREDO"
-        # Si se encontró sin "POINT" (ejemplo anterior), group(2) es "APODACA, NL"
-        incoterm_type = m_incoterm.group(1).upper()
-        location_raw = m_incoterm.group(2).strip()
-        
-        # Comprobamos si 'POINT' estaba presente en el texto
-        if "POINT" in terms_text_match.group(0): # Usamos el grupo 0 para revisar si POINT está cerca
-             data["Incotenn"] = f"{incoterm_type} POINT: {location_raw}"
-        else:
-            # Usamos la lógica del ejemplo anterior (DAT: APODACA, NL)
-            data["Incotenn"] = f"{incoterm_type}: {location_raw}"
-        
-    
-    # Payment Terms (ej. Net 60 Days)
-    m_pay = re.search(r"(Net\s*\d+\s*Days)", terms_text, re.I)
-    if m_pay:
-        data["Payment Terms"] = m_pay.group(1).strip()
+    results = extract_shipping_terms(full_text)
 
-    # Fechas (buscamos dos fechas en el texto cercano)
-    m_dates = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4}).{0,40}?(\d{1,2}/\d{1,2}/\d{2,4})", terms_text)
-    if m_dates:
-        # asumimos primera = Ship Date, segunda = Due Date (si aplica)
-        data["Ship Date"] = data["Ship Date"] or m_dates.group(1).strip()
-        data["Due Date"] = m_dates.group(2).strip()
-
-    # Método de envío (RAILCAR, TRUCK, COMMON CARRIER, etc.)
-    m_method = re.search(r"\b(RAILCAR|RAILCAR#\s*[A-Z0-9]+|TRUCK|COMMON\s+CARRIER|RAIL)\b", full_text, re.I)
-    if m_method:
-        # limpiar si viene con #
-        data["Method of Shipment"] = m_method.group(1).strip().replace("#", "").strip()
-
-    # ---------- 5. TRANSPORT No. ----------
-    tm = re.search(r"RAILCAR#\s*([A-Z0-9]+)", full_text, re.I)
-    if not tm:
-        tm = re.search(r"RAILCAR\s*([A-Z0-9]+)", full_text, re.I)
-    if not tm:
-        # Ahora busco TRUCK H10018 o RAILCAR FPAX980401
-        tm = re.search(r"(?:TRUCK|RAILCAR)\s*([A-Z0-9]+)", full_text, re.I)
-    if not tm:
-        tm = re.search(r"TRUCK#?\s*([A-Z0-9]+)", full_text, re.I)
-    if tm:
-        data["Transport No."] = tm.group(1).strip()
+    data["Incotenn"] = results.get("Incoterm")
+    data["Payment Terms"] = results.get("Payment Terms")
+    data["Ship Date"] = results.get("Ship Date")
+    data["Due Date"] = results.get("Due Date")  
+    data["Method of Shipment"] = results.get("Method of Shipment")
 
     # ---------- 6. DETALLES DE PRODUCTO (No se requiere ajuste) ----------
     # buscamos bloque entre encabezados Product No. ... Amount y el subtotal/TOTAL
@@ -370,12 +383,27 @@ paths = get_pdf_paths()
 
 completos = 0
 incompletos = 0
-documents = paths[0:250]
+documents = paths[0:248]
 
 for info_pdf in documents:
-    print(f"Procesando: {info_pdf['ruta']}")
+    # print(f"Procesando: {info_pdf['ruta']}")
     
     invoice = extract_invoice_data(info_pdf['ruta'])    
+    # "File", "Invoice No", "Invoice Date", "S/O#", "Incotenn", "Payment Terms", "Ship Date", "Due Date", "Method of Shipment", "Ship To", "Bill To", "Subtotal", "Total"
+    print(
+    f"{invoice.get('Invoice No')}\t|"
+    f"{invoice.get('Invoice Date')}\t|"
+    f"{invoice.get('S/O#')}\t|"
+    f"Incotenn: {invoice.get('Incotenn')}\t|"
+    f"PayTerms: {invoice.get('Payment Terms')}\t|"
+    f"Ship Date: {invoice.get('Ship Date')}\t|"
+    f"Due Date: {invoice.get('Due Date')}\t|"
+    f"MethodShipment: {invoice.get('Method of Shipment')}\t|"
+    f"{invoice.get('Subtotal')}\t|"
+    f"{invoice.get('Total')}\t|"
+    # f"{invoice.get('File')}"
+    )
+
     secciones_faltantes = validateInvoiceData(invoice)
     if not secciones_faltantes:
         completos += 1
@@ -384,7 +412,7 @@ for info_pdf in documents:
         print(f"   Secciones con datos faltantes: {', '.join(secciones_faltantes)}")
         incompletos += 1
 
-# #--- RESUMEN FINAL ---
+####### --- RESUMEN FINAL ---
 print("\n=============================================")
 print("📊 RESUMEN DEL PROCESAMIENTO")
 print("=============================================")
