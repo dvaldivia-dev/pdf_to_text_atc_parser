@@ -1,0 +1,143 @@
+/* Estilos Generales y de Página */
+@page {
+  size: A4;
+  margin: 1in;
+}
+body {
+  font-family: Arial, sans-serif;
+  font-size: 10pt;
+  color: #333;
+}
+
+/* Encabezado: Título y Datos Clave (Alineación Derecha) */
+.header-data {
+  width: 40%;
+  float: right;
+  text-align: right;
+  margin-bottom: 20px;
+}
+.invoice-title {
+  font-size: 28pt;
+  font-weight: bold;
+  color: #004d99;
+  margin-bottom: 5px;
+}
+.invoice-field {
+  margin-bottom: 3px;
+}
+
+/* Solución de Limpieza */
+.clear-float {
+  clear: both;
+  margin-top: 20px;
+}
+
+/* Bloques de Dirección */
+.address-container {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 50px;
+  margin-bottom: 30px;
+  table-layout: fixed;
+}
+.address-container td {
+  width: 50%;
+  padding: 10px;
+  border: 1px solid #ddd;
+  vertical-align: top;
+}
+.address-title {
+  font-weight: bold;
+  font-size: 11pt;
+  margin-bottom: 5px;
+}
+
+/* Tabla de Productos */
+.product-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 20px;
+}
+.product-table th,
+.product-table td {
+  border: 1px solid #ccc;
+  padding: 8px;
+  text-align: left;
+}
+.product-table th {
+  background-color: #e0f0ff;
+  text-align: center;
+  font-weight: bold;
+  font-size: 10pt;
+}
+.align-right {
+  text-align: right;
+}
+
+/* Totales Finales */
+.totals-container {
+  width: 300px;
+  float: right;
+  margin-top: 30px;
+  font-size: 12pt;
+}
+.totals-container p {
+  margin: 5px 0;
+  padding: 2px 0;
+}
+.total-row {
+  font-weight: bold;
+  border-top: 2px solid black;
+  padding-top: 5px;
+}
+
+/* Dentro de style.css */
+
+/* 1. Contenedor de Totales (Asegura la flotación) */
+.totals-container {
+  width: 300px;
+  float: right;
+  margin-top: 30px;
+  font-size: 12pt;
+  /* Eliminamos el 'text-align: right' aquí para dejar que la tabla interna maneje la alineación */
+}
+
+/* 2. Estilos para la nueva tabla interna de totales */
+.totals-table {
+  width: 100%;
+  border-collapse: collapse; /* Elimina el espacio entre celdas */
+}
+
+/* Estilos de las celdas de totales */
+.totals-table td {
+  padding: 2px 0; /* Espacio vertical reducido */
+  border: none; /* Asegura que no haya bordes de celda */
+}
+
+/* Columna de etiquetas (Subtotal:, Total:) */
+.totals-table .total-label {
+  text-align: left;
+  width: 40%;
+  font-weight: normal;
+}
+
+/* Columna de valores (Los números) */
+.totals-table .total-value {
+  text-align: right; /* ¡Alinea los valores numéricos a la derecha! */
+  width: 60%;
+  padding-right: 5px; /* Pequeño margen desde el borde */
+}
+
+/* 3. Estilo para la línea divisoria (Eliminar el separador y aplicar el borde al Total) */
+.totals-table .final-total {
+  /* La fila del total se distingue con una línea superior, y el texto se hace bold */
+  font-weight: bold;
+  /* ❌ ¡ESTA ES LA LÍNEA CLAVE PARA ELIMINAR EL SEPARADOR ANTERIOR! ❌ */
+  border-top: none;
+}
+
+/* Aplicar el borde superior SÓLO a las celdas de la fila final */
+.totals-table .final-total td {
+  border-top: 2px solid black;
+  padding-top: 5px;
+}

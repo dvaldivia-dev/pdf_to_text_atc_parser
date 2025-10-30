@@ -1,6 +1,8 @@
 import os
-import json
+import cv2
+import numpy as np
 import re
+from re import I, DOTALL
 from pathlib import Path
 from datetime import datetime, timedelta
 import pdfplumber
@@ -8,304 +10,828 @@ from findimagespdf.pdffile import PDFFile
 import pdfplumber
 from pdf2image import convert_from_path
 import pytesseract
+import tempfile
+import io
 
-def _ocr_from_pdf(pdf_path, dpi=300, lang="eng"):
+# Se asume que pdfplumber, convert_from_path, y pytesseract están importados.
+# Estas funciones se mantienen como referencia, pero la implementación
+# se enfocará en la nueva estructura de retorno.
+
+# convertir una imagen a texto
+def extraer_texto_ocr(pdf_path, page_number=1):
     """
-    Convierte todas las páginas del PDF a imágenes y aplica OCR
-    para extraer texto.
+    Convierte la primera página de un PDF en texto mediante OCR.
+    Usa preprocesamiento con OpenCV para mejorar la precisión.
     """
-    text = ""
-    images = convert_from_path(pdf_path, dpi)
-    for img in images:
-        text += pytesseract.image_to_string(img, lang=lang) + "\n"
-    return text
+    # ✅ No necesitamos poppler_path porque ya está en el PATH del sistema
+    imagenes = convert_from_path(pdf_path, dpi=300, first_page=page_number, last_page=page_number)
 
-def extract_shipping_terms(text):
-    import re
+    # Tomar la primera página
+    imagen_pil = imagenes[0]
 
-    pattern = re.compile(
-        # Encabezado: Incoterm... Method of Shipment
-        r"(?:Incoterm|lncoterm|lncotenn)\s*Payment\s*Terms\s*Ship\s*Date\s*Due\s*Date\s*Method\s*of\s*Shipment[ \r\n\t]*"
+    # Convertir a formato OpenCV
+    imagen_cv = cv2.cvtColor(np.array(imagen_pil), cv2.COLOR_RGB2BGR)
+
+    # Escala de grises + filtro de ruido
+    gris = cv2.cvtColor(imagen_cv, cv2.COLOR_BGR2GRAY)
+    gris = cv2.medianBlur(gris, 3)
+
+    # Binarizar (blanco y negro puro)
+    _, binaria = cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # binaria = cv2.adaptiveThreshold(gris, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+
+    # (Opcional) guardar para verificar visualmente
+    if page_number == 1:
+        cv2.imwrite("debug_imagen.png", binaria)
+
+    # OCR con configuración flexible para texto multicolumna
+    config = "--psm 4"
+    texto = pytesseract.image_to_string(binaria, lang='eng', config=config)
+
+    # Guardar el texto detectado (para depuración)
+    # with open("texto_ocr.txt", "w", encoding="utf-8") as f:
+    #     f.write(texto)
+
+    return texto
+
+# de las hojas extraidas y convertidas a texto cual es la que tiene la informacion de la factura.
+def find_invoice_page_text(pages_text_list):
+    """
+    Busca en la lista de páginas la única que contenga los indicadores clave 
+    de una factura (Invoice No/Date Y Ship To/Bill To).
+    
+    Args:
+        pages_text_list (list): Lista de strings, donde cada string es el texto de una página.
+
+    Returns:
+        str: El texto de la página identificada como la principal de la factura.
+    """
+    # Indicadores de que es la página principal de la factura
+    # Debe tener el encabezado (Invoice No o Invoice Date)
+    invoice_indicators = re.compile(r"(Invoice\s*No|Invoice\s*Date)", re.I)
+    # Y debe tener las direcciones
+    address_indicators = re.compile(r"(Ship\s*To|Bill\s*To)", re.I)
+
+    for text in pages_text_list:
+        # Normalizamos el texto de la página a una sola línea para que la búsqueda sea robusta
+        text_one_line = re.sub(r'[\r\n]+', ' ', text)
         
-        # Incoterm: Se detiene justo antes de un 'Payment Terms' conocido.
-        r"(?P<incoterm>[A-Z0-9\s,.:/]+?)\s*" 
-        r"(?=(Net\s*\d+\s*Days|Prepaid|Collect|))" 
+        # Condición: La página DEBE contener ambos conjuntos de indicadores
+        if invoice_indicators.search(text_one_line) and address_indicators.search(text_one_line):
+            # ¡Página de la factura encontrada!
+            return text
+    
+    # Fallback: Si ninguna página cumple la condición, devolvemos la primera como mejor suposición.
+    if pages_text_list:
+        # print("⚠️ No se identificó la página de la factura con claridad. Usando la primera página.")
+        return pages_text_list[0]
+        
+    return ""
 
-        # Payment Terms: Captura el término de pago.
-        r"(?P<payment_terms>Net\s*\d+\s*Days|Prepaid|Collect|)\s*" 
-        r"[ \r\n\t]*"
+def find_invoice_page_index(pages_text_list):
+    """
+    Devuelve el índice de la página más probable que contenga los datos principales del invoice.
+    Usa un sistema de puntuación basado en indicadores.
+    """
 
-        # Ship Date (obligatoria en este contexto).
-        r"(?P<ship_date>\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{2,4})" 
-        r"[ \r\n\t]*" 
+    if not pages_text_list:
+        return None
 
-        # Due Date (HACEMOS ESTE CAMPO OPCIONAL CON ?).
-        r"(?P<due_date>\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{2,4})?" 
-        r"[ \r\n\t]*" 
+    invoice_keywords = [
+        "invoice no", "invoice date", "invoice#", "inv no", "inv date"
+    ]
+    address_keywords = [
+        "ship to", "bill to", "consignee", "customer", "sold to"
+    ]
+    financial_keywords = [
+        "subtotal", "total", "payment terms", "due date", "method of shipment", "incoterm"
+    ]
 
-        # Method of Shipment.
-        r"(?P<method>[A-Za-z\s,.]+?)"
-        r"(?:\s+Product No)", 
+    best_score = 0
+    best_index = None
 
-        re.IGNORECASE | re.DOTALL
+    for i, text in enumerate(pages_text_list):
+        text_lower = text.lower().replace("\n", " ")
+        score = 0
+
+        # Suma puntos según palabras clave encontradas
+        score += sum(1 for k in invoice_keywords if k in text_lower)
+        score += sum(1 for k in address_keywords if k in text_lower)
+        score += sum(1 for k in financial_keywords if k in text_lower)
+
+        # Bonus si hay tanto invoice como address info
+        if any(k in text_lower for k in invoice_keywords) and any(k in text_lower for k in address_keywords):
+            score += 2
+
+        if score > best_score:
+            best_score = score
+            best_index = i
+
+    # Si nada fue detectado, usa la primera página como fallback
+    return best_index if best_index is not None else 0
+
+def get_pdf_text_with_ocr_fallback(pdf_source, min_text_length=50, max_pages_to_read=None):
+    """
+    Intenta extraer texto de un PDF (ruta de archivo o bytes) usando pdfplumber. 
+    Si el texto de una página es insuficiente, recurre a OCR SÓLO para esa página.
+    
+    :param pdf_source: Ruta del archivo (str) O contenido del PDF en bytes (bytes).
+    
+    Returns:
+        tuple: (full_text, pages_text_list). 
+             full_text es todo el texto.
+             pages_text_list es una lista con el texto de cada página.
+    """
+    pages_text_list = []
+    temp_file_path = None # Variable para guardar la ruta temporal del archivo
+    
+    # 1. Determinar si es bytes o ruta, y preparar pdfplumber y la ruta para OCR
+    try:
+        if isinstance(pdf_source, bytes):
+            # Es bytes: Creamos un archivo temporal para que las funciones basadas en ruta funcionen.
+            # Nota: Si el OCR (extraer_texto_ocr) pudiera aceptar bytes, ¡sería mejor!
+            # Creamos el archivo temporal en un contexto 'with' para asegurar su cierre.
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+            temp_file.write(pdf_source)
+            temp_file.close()
+            temp_file_path = temp_file.name
+            
+            # Preparamos el stream de bytes para pdfplumber
+            pdf_plumber_source = io.BytesIO(pdf_source)
+            pdf_path_for_ocr = temp_file_path
+            
+        elif isinstance(pdf_source, str):
+            # Es una ruta: Usamos la ruta directamente para pdfplumber y OCR.
+            pdf_plumber_source = pdf_source
+            pdf_path_for_ocr = pdf_source
+            
+        else:
+            raise TypeError("pdf_source debe ser str (ruta) o bytes (contenido del PDF).")
+            
+    except Exception as e:
+        print(f"❌ Error al preparar la fuente del PDF: {e}")
+        return "", []
+
+    try:
+        # 2. Abre el PDF con pdfplumber (desde la ruta o el stream de bytes)
+        with pdfplumber.open(pdf_plumber_source) as pdf:
+            
+            num_pages = len(pdf.pages)
+            pages_to_read = num_pages if max_pages_to_read is None else min(max_pages_to_read, num_pages)
+            
+            for i in range(pages_to_read):
+                page_num = i + 1
+                page = pdf.pages[i]
+                
+                # --- Intento 1: Extracción de texto plano (pdfplumber) ---
+                page_content = page.extract_text() or ""
+                
+                if len(page_content.strip()) < min_text_length:
+                    # print(f"Página {page_num}: Texto plano insuficiente. Recurriendo a OCR...")
+                    # --- Intento 2: OCR solo en esta página usando la ruta temporal ---
+                    # USAMOS la ruta del archivo (original o temporal) para el OCR
+                    # print("ruta" + pdf_path_for_ocr )
+                    ocr_content = extraer_texto_ocr(pdf_path_for_ocr, page_num)
+                    
+                    # Si el OCR proporciona un texto significativamente mejor
+                    if len(ocr_content.strip()) > len(page_content.strip()):
+                        page_content = ocr_content
+                        # print(f"Página {page_num}: Éxito con OCR.")
+                    # else:
+                        # print(f"Página {page_num}: El OCR no mejoró el resultado o fue nulo.")
+
+                if page_content:
+                    pages_text_list.append(page_content)
+                
+            full_text = "\n".join(pages_text_list)
+            return full_text, pages_text_list
+            
+    except Exception as e:
+        print(f"❌ Error crítico al procesar el PDF: {e}")
+        return "", []
+        
+    finally:
+        # 3. Limpieza: Eliminar el archivo temporal si fue creado
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+                # print(f"Archivo temporal eliminado: {temp_file_path}")
+            except OSError as e:
+                print(f"Advertencia: No se pudo eliminar el archivo temporal {temp_file_path}: {e}")
+
+# PASO 1
+def extract_headers(text):
+    # corregimos S/0# -> S/O#
+    text = text.replace("S/0#", "S/O#")
+    # patrones básicos
+    m_inv = re.search(r"Invoice\s*No[:\s]*([A-Za-z0-9\-]+)", text, re.I)
+    if m_inv:
+        invoiceNumber = m_inv.group(1).strip()
+
+    m_invdate = re.search(r"Invoice\s*Date[:\s]*([\d\-/\s]+)", text, re.I)
+    if m_invdate:
+        invoiceDate = re.sub(r"\s+", "", m_invdate.group(1).strip())
+
+    m_so = re.search(r"(?:S/O#|S/O\s*NO)\s*[:\s]*([A-Za-z0-9\-]+)", text, re.I)
+    if m_so:
+        invoiceSO = m_so.group(1).strip()
+    
+    return {
+        "Invoice No": invoiceNumber,
+        "Invoice Date": invoiceDate,
+        "S/O#": invoiceSO
+    }
+
+# Obtiene el valor de el pedimento buscando en todas las hojas el pdf. El S/O# puede ser erroneo, por es se busca como opcion en todas las hojas.
+def extract_so_no(text):
+    # La regex busca "S/O NO", seguida de ":", luego opcionalmente espacios,
+    # y finalmente captura cualquier carácter (dígitos, letras, etc.) hasta
+    # encontrar un espacio o un fin de línea.
+    # El 're.I' (IGNORECASE) es opcional aquí pero buena práctica.
+    
+    # Explicación de la regex:
+    # S/O\s*NO\s*:\s* -> Coincide con 'S/O NO' y el ':' (permite espacios entre y después)
+    # (.*?)            -> Grupo de captura: captura *cualquier* carácter (.*),
+    #                     pero de forma no codiciosa (?), es decir, hasta el primer
+    #                     fin de línea o nuevo separador.
+    # La expresión más específica es:
+    so_no_match = re.search(r"S/O\s*NO\s*:\s*([A-Z0-9]+)", text, re.I)
+
+    results = {}
+    
+    if so_no_match:
+        # Capturamos y limpiamos el valor
+        so_no_str = so_no_match.group(1).strip()
+        results["S/O NO"] = so_no_str
+    else:
+        # Intentar una segunda opción si el formato es diferente (como S/O#)
+        so_no_match_alt = re.search(r"S/O#\s*([A-Z0-9]+)", text, re.I)
+        if so_no_match_alt:
+            so_no_str = so_no_match_alt.group(1).strip()
+            results["S/O NO"] = so_no_str
+        else:
+            results["S/O NO"] = None
+    
+    return results
+
+#PASO 2
+# Constantes (se asume que I y DOTALL son re.IGNORECASE y re.DOTALL respectivamente)
+I = re.IGNORECASE
+DOTALL = re.DOTALL
+
+# Direcciones
+PLASTICOS_BAJIO_MEXICO_ADDRESS = "Km 19.5, Carretera Panamericana, S/N\nParque Industrial El Bajío\nCuerámaro, GTO 36960 MEXICO"
+REYMA_MEXICO_ADDRESS = "Calzada Industrial de la Manufactura No. 35\nParque Industrial Nogales, SO 84094 L MEXICO"
+REYMA_US_SHIPTO_ADDRESS = "c/o BDP International\n801 Hanover Drive\nGrapevine, TX 76051"
+ARROW_MAGNOLIA_ADDRESS = "28789 Hardin Store Rd. Suite 230\nMagnolia, TX 77394"
+ARROW_MAGNOLIA_ALT = "28789 Hardin Store Rd. Suite 230\nMagnolia, TX 77354"
+EAGLE_PASS_ADDRESS = "c/o Villarreal & Medina Forwarding Inc.\n14404 Investment Ave.\nEagle Pass, TX 78852"
+LAREDO_ADDRESS = "c/o Medina Logistic Services, Inc.\n14402 Investment Ave.\nLaredo, TX 78045"
+
+def extract_shipto_billto(text):
+    # --- Limpieza agresiva ---
+    def aggressive_cleanup(t):
+        t = re.sub(r'[\r\n]', ' ', t)
+        t = re.sub(r'\s{2,}', ' ', t)
+        t = re.sub(r'[^a-zA-Z0-9\s\,\.\/\:\-\&]+', '', t)
+        t = re.sub(r'(BOP|BDP)\s*Internat(ional|emational)', 'BDP International', t, flags=I)
+        t = re.sub(r'clo\s*BDP', 'c/o BDP', t, flags=I)
+        t = re.sub(r'c o BDP', 'c/o BDP', t, flags=I)
+        t = re.sub(r'ArrowTrading', 'Arrow Trading', t, flags=I)
+        t = re.sub(r'Villarreal\s*&\s*Medina\s*Forwarding\s*Inc', 'Villarreal & Medina Forwarding Inc', t, flags=I)
+        t = re.sub(r'Polietiienos', 'Polietilenos', t, flags=I)
+        return t.strip()
+
+    text = aggressive_cleanup(text)
+    text = re.sub(r'Adherib\s+les', 'Adheribles', text, flags=re.I)
+    text = re.sub(r'Plasticos?\s+Adheribles?', 'Plasticos Adheribles', text, flags=re.I)
+
+    # --- Patrones base ---
+    mexican_name_pattern = (
+    r"(Pl[aá]stic\s*os?\s*Adherib?\s*les?\s*del\s*Baj[ií]o|"
+    r"Grupo\s*Industrial\s*Reyma|"
+    r"Polietilenos?\s*del\s*Centro|"
+    r"Reyma\s*Del\s*Noroeste|"
+    r"Polietilenos?\s*Del\s*Centro)"
     )
 
-    match = pattern.search(text)
+    arrow_pattern = r"Arrow\s*Trading\s*LLC"
+    villarreal_pattern = r"Villarreal\s*&\s*Medina\s*Forwarding\s*Inc"
+    bdp_pattern = r"(c/o\s*BDP|BDP\s*International|c/o\s*BOP|BOP\s*International)"
+    medina_pattern = r"Medina\s*Logistic\s*Services"
 
+    # --- Extraer bloques ---
+    shipto_block = re.search(r'Ship To:\s*(.*?)\s*Bill To:', text, flags=I | DOTALL)
+    shipto_text = shipto_block.group(1).strip() if shipto_block else ""
+    billto_block = re.search(r'Bill To:\s*(.*?)(RFC:|Incoterm|Payment|Subtotal|TOTAL|Product No\.|$)', text, flags=I | DOTALL)
+    billto_text = billto_block.group(1).strip() if billto_block else ""
+
+    # Si ShipTo: está vacío y BillTo tiene contenido (maneja tu caso de mezcla)
+    if not shipto_text and billto_text:
+        match_mexican_in_billto = re.search(mexican_name_pattern, billto_text, flags=I)
+        if match_mexican_in_billto:
+            shipto_text = billto_text # Forzamos la búsqueda de forwarder en el bloque BillTo
+
+    # --- Detectar coincidencias ---
+    has_mexican = re.search(mexican_name_pattern, text, flags=I)
+    has_arrow = re.search(arrow_pattern, text, flags=I)
+    has_villarreal = re.search(villarreal_pattern, text, flags=I)
+    has_bdp = re.search(bdp_pattern, text, flags=I)
+    has_medina = re.search(medina_pattern, text, flags=I)
+
+    ship_to_address = "Ship To Not Found"
+    bill_to_address = "Bill To Not Found"
+
+    # --- Detección dentro del bloque ShipTo/BillTo ---
+    ship_block_mex = re.search(mexican_name_pattern, shipto_text, flags=I)
+    bill_block_arrow = re.search(arrow_pattern, billto_text, flags=I)
+    
+    # 🎯 CASO PRINCIPAL: Hay Arrow y un cliente mexicano
+    if has_mexican and has_arrow:
+        
+        # 1. Determinar el Nombre Mexicano
+        mexican_name_match = ship_block_mex if ship_block_mex else has_mexican
+        mexican_name = re.sub(r'\s+', ' ', mexican_name_match.group(0).strip())
+
+        # 2. Asignar Bill To (USANDO bill_block_arrow)
+        if bill_block_arrow:
+            # Normalizamos el nombre de Arrow
+            arrow_name = re.sub(r'\s+', ' ', bill_block_arrow.group(0).strip())
+            
+            # Revisa el código postal de Arrow en el bloque Bill To
+            if re.search(r'77354', billto_text):
+                bill_to_address = f"{arrow_name}\n{ARROW_MAGNOLIA_ALT}"
+            else:
+                bill_to_address = f"{arrow_name}\n{ARROW_MAGNOLIA_ADDRESS}"
+        else:
+            # Fallback si no se encontró Arrow en el bloque Bill To, pero sí globalmente
+            bill_to_address = f"Arrow Trading LLC\n{ARROW_MAGNOLIA_ALT}"
+
+
+        # 3. Asignar Ship To (Usando Forwarder detectado)
+        if re.search(medina_pattern, shipto_text, flags=I) or has_medina:
+            ship_to_address = f"{mexican_name} SA de CV\n{LAREDO_ADDRESS}"
+        elif re.search(villarreal_pattern, shipto_text, flags=I) or has_villarreal:
+            ship_to_address = f"{mexican_name} SA de CV\n{EAGLE_PASS_ADDRESS}"
+        elif re.search(bdp_pattern, shipto_text, flags=I) or has_bdp:
+            ship_to_address = f"{mexican_name} SA de CV\n{REYMA_US_SHIPTO_ADDRESS}"
+        else:
+            ship_to_address = f"{mexican_name} SA de CV\n{REYMA_US_SHIPTO_ADDRESS}" 
+
+    # --- Fallbacks de un solo cliente (Lógica se mantiene igual) ---
+    elif has_mexican:
+        mexican_name = re.sub(r'\s+', ' ', has_mexican.group(0).strip())
+        ship_to_address = f"{mexican_name} SA de CV\n{REYMA_US_SHIPTO_ADDRESS}"
+        if "Plasticos Adheribles del Bajio" in mexican_name:
+             bill_to_address = f"{mexican_name} SA de CV\n{PLASTICOS_BAJIO_MEXICO_ADDRESS}"
+        else:
+             bill_to_address = f"{mexican_name} SA de CV\n{REYMA_MEXICO_ADDRESS}"
+
+    elif has_arrow:
+        ship_to_address = f"Arrow Trading LLC\n{REYMA_US_SHIPTO_ADDRESS}"
+        bill_to_address = f"Arrow Trading LLC\n{ARROW_MAGNOLIA_ALT}"
+
+    # --- Limpieza final ---
+    def final_cleanup(addr):
+        if not addr or addr == "Ship To Not Found" or addr == "Bill To Not Found":
+            return addr
+        # Normalización de nombres de clientes
+        addr = re.sub(r'Plasticos Adheribles del Bajio SA de CV', 'Plasticos Adheribles del Bajio S.A. de C.V.', addr)
+        addr = re.sub(r'Polietilenos del Centro SA de CV', 'Polietilenos del Centro S.A. de C.V.', addr)
+        addr = re.sub(r'Grupo Industrial Reyma SA de CV', 'Grupo Industrial Reyma S.A. de C.V.', addr)
+        
+        addr = re.sub(r'\s{2,}', ' ', addr)
+        addr = re.sub(r'[\r\n]{2,}', '\n', addr)
+        return addr.strip()
+
+    return {
+        "Ship To": final_cleanup(ship_to_address),
+        "Bill To": final_cleanup(bill_to_address),
+    }
+
+# PASO 3
+def extract_shipping_terms(text):
+    """
+    Extrae los términos de envío (Incoterm, Payment Terms, Fechas y Método) 
+    de un bloque de texto de factura.
+    """
+    # Patrón mejorado: Usa \s* y capturas no codiciosas para mayor flexibilidad.
+    pattern = re.compile(
+        # 1. Anclaje del encabezado (flexible con lncotenn/Incoterm)
+        r"(?:Incoterm|lncoterm|lncotenn)\s*Payment\s*Terms\s*Ship\s*Date\s*Due\s*Date\s*Method\s*of\s*Shipment\s*"
+        
+        # 2. Incoterm: Captura no codiciosa hasta que encuentra el patrón de Payment Terms
+        r"(?P<incoterm>.*?)\s*" 
+        
+        # 3. Payment Terms: Debe coincidir con los términos conocidos (Net XX Days, Prepaid, Collect)
+        r"(?P<payment_terms>Net\s*\d+\s*Days|Prepaid|Collect)\s*" 
+        
+        # 4. Ship Date: Formato de fecha flexible
+        r"(?P<ship_date>\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{2,4})\s*" 
+        
+        # 5. Due Date: Formato de fecha flexible (opcional)
+        r"(?P<due_date>\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{2,4})?\s*" 
+        
+        # 6. Method of Shipment: Captura no codiciosa hasta que encuentra el ancla final
+        r"(?P<method>.*?)"
+        
+        # 7. Ancla final: debe terminar antes del encabezado de la tabla de productos
+        r"(?:\s+Product\s*No)", 
+        re.IGNORECASE | re.DOTALL
+    )
+    
+    match = pattern.search(text)
+    
     if match:
         incoterm = match.group("incoterm").strip() if match.group("incoterm") else None
         payment_terms = match.group("payment_terms").strip() if match.group("payment_terms") else None
         ship_date = match.group("ship_date").strip() if match.group("ship_date") else None
         due_date = match.group("due_date").strip() if match.group("due_date") else None
         method = match.group("method").strip() if match.group("method") else None
-
-        # 🔹 Limpieza de Incoterm
-        if incoterm and incoterm.endswith(':'):
-            incoterm = incoterm[:-1].strip()
-
-        # 🔹 Limpieza de Payment Terms
-        if not payment_terms:
-            payment_terms = None
-
-        # 🔹 Lógica de RAILCAR que tenías (aunque 'RAILCAR' ya debe ser el método)
-        if method and method.upper() == "LEON" and "RAILCAR" in text.upper():
-            method = "RAILCAR"
+        
+        # Lógica de limpieza y corrección (preservada)
+        if incoterm and incoterm.endswith(':'): incoterm = incoterm[:-1].strip()
+        if method and method.upper() == "LEON" and "RAILCAR" in text.upper(): method = "RAILCAR"
         
         return {
-            "Incoterm": incoterm,
-            "Payment Terms": payment_terms,
+            "Incoterm": incoterm, 
+            "Payment Terms": payment_terms, 
             "Ship Date": ship_date,
-            "Due Date": due_date,
+            "Due Date": due_date, 
             "Method of Shipment": method
         }
-
+        
     return {
-        "Incoterm": None,
-        "Payment Terms": None,
-        "Ship Date": None,
-        "Due Date": None,
-        "Method of Shipment": None
+        "Incoterm": None, "Payment Terms": None, "Ship Date": None, 
+        "Due Date": None, "Method of Shipment": None
     }
-
-def extract_invoice_data(pdf_path):
+# PASO 4    
+def safe_float_conversion(value_str):
+    if value_str:
+        # Eliminar comas de miles y convertir a float
+        return float(value_str.replace(',', ''))
+    return None
+        
+def extract_product_detail(text):
     """
-    Versión mejorada de extracción para encabezado, términos, direcciones,
-    detalles de producto y totales. Maneja errores OCR comunes (lncotenn / Incotenn),
-    direcciones 'Ship To: Bill To:' en bloque, y detecta métodos de envío.
+    Extrae los detalles de la línea de producto, manejando Product No. faltante, 
+    y corrigiendo la extracción de Qty/U/M corrupta.
     """
-    data = {
-        "File": os.path.basename(pdf_path),
-        "Invoice No": None,
-        "Invoice Date": None,
-        "S/O#": None,
-        "Incotenn": None,
-        "Payment Terms": None,
-        "Ship Date": None,
-        "Due Date": None,
-        "Method of Shipment": None,
-        "Ship To": None,
-        "Bill To": None,
-        "Subtotal": None,
-        "Total": None,
-        "Transport No.": None,
-        "Product Details": []
-    }
+    
+    # 0. Limpieza y Normalización
+    text_precleaned = re.sub(r'Product\s*No\.\s*\|\s*Hem\s*Gly', 'Product No. ', text, flags=re.I)
+    text_precleaned = re.sub(r'[\r\n]+', ' ', text_precleaned) 
+    text_precleaned = re.sub(r'[\s|]+', ' ', text_precleaned).strip()
+    text_precleaned = re.sub(r'_', ' ', text_precleaned).strip()
+    
+    # --- 1. Aislar el Bloque de Datos del Producto ---
+    prod_block_match = re.search(r"Product No\.\s*(.*?)\s*(?:Subtotal|TOTAL)", text_precleaned, re.I | re.DOTALL)
+    
+    if prod_block_match:
+        prod_data_block = prod_block_match.group(1).strip()
+        
+        # 2. Limpieza de Encabezado Residual
+        header_clean_pattern = r"^\s*Item\s*Qty\s*U\/M\s*Description\s*Price\s*Each\s*Amount\s*"
+        prod_data_block = re.sub(header_clean_pattern, " ", prod_data_block, flags=re.I | re.DOTALL).strip()
 
-    # --- Lectura del texto (pdfplumber / OCR) ---
-    try:
-        import pdfplumber
-        with pdfplumber.open(pdf_path) as pdf:
-            if not pdf.pages:
-                full_text = ""
-            else:
-                # concatenamos varias páginas (hasta 3) porque COA a menudo continúa
-                pages_text = []
-                for i in range(min(3, len(pdf.pages))):
-                    pages_text.append(pdf.pages[i].extract_text() or "")
-                full_text = "\n".join(pages_text)
-            if len(full_text.strip()) < 20:
-                raise ValueError("Texto insuficiente — posible PDF escaneado")
-    except Exception:
-        # fallback a OCR si no hay texto
-        full_text = _ocr_from_pdf(pdf_path)
-
-    # print(full_text)
-
-    # Normalizar para búsquedas
-    full_text_norm = re.sub(r"\r", "\n", full_text)
-    full_text_one = re.sub(r"[\r\n]+", " ", full_text_norm)
-
-    # ---------- 0. DETECCIÓN COA ----------
-    is_coa = bool(re.search(r"CERTIFICATE OF ANALYSIS|FORMOSA PLASTICS CORPORATION", full_text, re.I))
-
-    # ---------- 1. HEADER (Invoice No, Invoice Date, S/O#) ----------
-    # corregimos S/0# -> S/O#
-    full_text_one = full_text_one.replace("S/0#", "S/O#")
-    # patrones básicos
-    m_inv = re.search(r"Invoice\s*No[:\s]*([A-Za-z0-9\-]+)", full_text_one, re.I)
-    if m_inv:
-        data["Invoice No"] = m_inv.group(1).strip()
-
-    m_invdate = re.search(r"Invoice\s*Date[:\s]*([\d\-/\s]+)", full_text_one, re.I)
-    if m_invdate:
-        data["Invoice Date"] = re.sub(r"\s+", "", m_invdate.group(1).strip())
-
-    m_so = re.search(r"(?:S/O#|S/O\s*NO)\s*[:\s]*([A-Za-z0-9\-]+)", full_text_one, re.I)
-    if m_so:
-        data["S/O#"] = m_so.group(1).strip()
-
-    # si es COA, puede contener DATE SHIPPED
-    if is_coa:
-        m_shipd = re.search(r"DATE\s*SHIPPED\s*[:\s]*([\d/]+)", full_text, re.I)
-        if m_shipd:
-            data["Ship Date"] = m_shipd.group(1).strip()
-
-    # ----------------------------------------------------------------------
-    # ---------- 2. LIMPIEZA DE BLOQUE DE DIRECCIONES (Ajustado) ----------
-    # ----------------------------------------------------------------------
-    def clean_address_block(raw_text):
-        if not raw_text:
-            return None
-        lines = []
-        exclusion = re.compile(
-            r"Sterling|Voice|Fax|Federal ID|Incoterm|Incotenn|lncotenn|Payment Terms|"
-            r"Ship Date|Due Date|Method of Shipment|INVOICE|Product No\.|QTY|U/M|Price Each|Amount|"
-            r"(?:DAT|DAP)\s*[:\s]*|Net\s*\d+\s*Days|RAILCAR|TRUCK|Subtotal|TOTAL|FORMOSA|CERTIFICATE|CUSTOMER:|RFC:", # AGREGADO: Excluir RFC: al limpiar líneas
-            re.I
+        # 3-4. Extracción y Limpieza de Transport No.
+        transport_match = re.search(r"((RAILCAR|TRUCK|VESSEL)\s*#\s*([A-Z0-9]+))", prod_data_block, re.I)
+        transport_no = transport_match.group(1).strip() if transport_match else None
+        clean_data_block = re.sub(r'(RAILCAR|TRUCK|VESSEL)\s*#\s*[A-Z0-9]+', '', prod_data_block, flags=re.I).strip()
+        
+        # --- 5. Extracción de la Línea de Producto ---
+        
+        product_pattern_final = re.compile(
+            # Captura 1: Product No. - Hacemos el patrón alfanumérico OPCIONAL
+            r"([A-Z0-9\-]+)?\s*"
+            # Captura 2: Bloque combinado (AHORA DEBE INCLUIR LA CANTIDAD Y U/M)
+            r"(.*?)"                      
+            # Captura 3: Price Each (El número que antecede al monto total)
+            r"\s+([\d,\.]+)\s*"           
+            # Captura 4: Amount (El decimal que completa el monto total)
+            r"([\d,]+\.\d+)"              
+            , re.I | re.DOTALL
         )
-        for ln in raw_text.splitlines():
-            ln2 = re.sub(r"\s{2,}", " ", ln).strip()
-            if not ln2:
-                continue
-            if exclusion.search(ln2):
-                continue
-            lines.append(ln2)
-        return "\n".join(lines) if lines else None
+        
+        plm = product_pattern_final.search(clean_data_block)
+        
+        if plm:
+            product_no = plm.group(1).strip() if plm.group(1) else None
+            
+            # 6. Descomponer el bloque combinado (plm.group(2))
+            combined_block_raw = plm.group(2).strip()
+            extracted_price_each_from_end = plm.group(3).strip() 
+            extracted_amount = plm.group(4).strip()
 
-    # ---------- 3. EXTRAER Ship To / Bill To cuando vienen juntos ----------
-    # Capturamos el bloque que sigue a "Ship To" y "Bill To"
-    addr_block_match = re.search(
-        r"Ship\s*To\s*:?\s*Bill\s*To\s*:?\s*(.*?)(?:Incoterm|Incotenn|lncotenn|Payment\s*Terms|Product\s*No\.|Subtotal|TOTAL|FORMOSA|CUSTOMER:)",
-        full_text,
-        re.I | re.DOTALL
+            # 7. Descontaminación: Extraer el Precio por Unidad real (0.57500)
+            price_each_match = re.search(r"([\d\.]+)\s*$", combined_block_raw) # Busca el flotante al final
+            
+            if price_each_match:
+                item_price_each = price_each_match.group(1)
+                # Elimina el precio unitario del combined_block
+                combined_block = re.sub(r"\s*([\d\.]+)$", '', combined_block_raw).strip()
+            else:
+                item_price_each = extracted_price_each_from_end
+                combined_block = combined_block_raw
+            
+            # --- 8. Extracción de Qty, U/M, Description (Ajuste Crítico de Qty) ---
+            item_qty, um, desc = None, None, combined_block 
+            
+            # PATRÓN AJUSTADO: ([\d,]+) asegura que la cantidad con comas se capture como un solo grupo
+            
+            # Intenta Qty/U/M (195,800/LBS)
+            qty_um_desc_pattern_slash = re.compile(r"([\d,]+)\s*/([A-Za-z]+)\s*(.*)", re.I | re.DOTALL)
+            qty_um_desc_match = qty_um_desc_pattern_slash.search(combined_block)
+
+            if qty_um_desc_match:
+                item_qty = qty_um_desc_match.group(1).strip()
+                um = qty_um_desc_match.group(2).strip()
+                desc = qty_um_desc_match.group(3).strip()
+            
+            else:
+                # Fallback para Qty U/M (195,800 LBS)
+                qty_um_desc_pattern_space = re.compile(r"([\d,]+)\s+([A-Za-z]+)\s+(.*)", re.I | re.DOTALL)
+                qty_um_desc_match_fb = qty_um_desc_pattern_space.search(combined_block)
+                
+                if qty_um_desc_match_fb:
+                    item_qty = qty_um_desc_match_fb.group(1).strip()
+                    um = qty_um_desc_match_fb.group(2).strip()
+                    desc = qty_um_desc_match_fb.group(3).strip()
+            
+            # Limpieza final de la Descripción
+            desc = re.sub(r'RAIL$|TRUCK$|VESSEL$', '', desc, flags=re.I).strip()
+
+            # Reconstruir el Amount de la factura (ej: '112' + '585.00' -> '112585.00')
+            if extracted_price_each_from_end.count('.') == 0 and extracted_amount.count('.') == 1:
+                # Si el Price Each extraído es un entero y el Amount es un decimal, asumimos que están unidos
+                full_amount = extracted_price_each_from_end + extracted_amount
+            else:
+                # Si el Price Each o el Amount ya tienen comas, usamos el Amount extraído
+                 full_amount = extracted_amount
+            
+            item_qty_num = safe_float_conversion(item_qty)
+            price_each_num = safe_float_conversion(item_price_each)
+            amount_num = safe_float_conversion(full_amount)
+
+            return {
+                "Product No.": product_no,
+                "Item Qty": item_qty_num,
+                "U/M": um,
+                "Description": desc,
+                "Transport No.": transport_no, 
+                "Price Each": price_each_num, 
+                "Amount": amount_num
+            }
+            
+    # Retorno por defecto
+    return {
+        "Product No.": None, "Item Qty": None, "U/M": None, "Description": None,
+        "Transport No.": None, "Price Each": None, "Amount": None
+    }
+
+def extract_raildcar_v1(text):
+    # Definición de patrones base
+    base_pattern = r"(RAILCAR|TRUCK|VESSEL)\s*#?\s*"
+    
+    # --- 1. Patrón para IDs de VAGÓN (RAILCAR) - Prioridad A (Con estructura LLLLNNNN) ---
+    # Busca la estructura alfanumérica típica de un vagón y permite un espacio interno.
+    # [A-Z]{2,4}[A-Z0-9]{0,4}\s*[0-9]{4,} -> FPAX21 4289
+    pattern_railcar_item = re.compile(
+        base_pattern + r"([A-Z]{2,4}[A-Z0-9]{0,4}\s*[0-9]{4,6})",
+        re.I
     )
 
-    if addr_block_match:
-        block = addr_block_match.group(1).strip()
-        # El bloque contiene ambas direcciones separadas por el patrón de la segunda dirección
+    # --- 2. Patrón para IDs de CAMIÓN/NÚMERICOS (TRUCK/VESSEL) - Prioridad B ---
+    # Captura cualquier ID alfanumérico O puramente NUMÉRICO de 4 a 10 caracteres.
+    # Esto soluciona IDs cortos como '1454'.
+    pattern_truck_item = re.compile(
+        base_pattern + r"([A-Z0-9]{4,10})", # Longitud mínima reducida a 4
+        re.I
+    )
+    
+    # --- Lógica de Extracción ---
+    transport_id_raw = None
+
+    # A. Intentar Patrón de VAGÓN (Específico para IDs largos con letras y números)
+    transport_match = pattern_railcar_item.search(text)
+    if transport_match:
+        transport_id_raw = transport_match.group(2).strip()
+    
+    # B. Intentar Patrón de CAMIÓN (Si el de vagón falla)
+    if not transport_id_raw:
+        transport_match = pattern_truck_item.search(text)
+        if transport_match:
+            transport_id_raw = transport_match.group(2).strip()
+
+    # --- Limpieza del Resultado Final (CRUCIAL) ---
+
+    if transport_id_raw:
+        # 1. Eliminación de palabras clave pegadas: Limpia contaminantes.
+        transport_no = re.sub(
+            r'[\W\s]*?(CUSTID|SEALNO|SHIPPER|P\d{2}[A-Z]\d{3}|Subtotal|LOT\s*NO|SPIDSP|PRODUCT\s*NO|PPOOLLYYPP).*',
+            '',
+            transport_id_raw,
+            flags=re.I
+        )
         
-        # Estrategia 1: Buscar la etiqueta explícita de la segunda dirección (Bill To)
-        # En el nuevo ejemplo, Bill To es "ArrowTrading LLC." y Ship To es "Plasticos Adheribles..."
-        
-        # Usamos el RFC: como un posible separador o indicador del fin del Bill To anterior,
-        # aunque en este caso está al final del Bill To.
-        
-        # Separación basada en la línea que contiene el Bill To o su dirección
-        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
-        
-        # Buscamos la línea que probablemente marca el inicio del Bill To
-        # En el ejemplo: "ArrowTrading LLC." es la primera línea del Bill To
-        # La forma más segura es usar el RFC como referencia si está mal estructurado.
-        
-        bill_to_idx = None
-        for i, ln in enumerate(lines):
-            # Asumimos que la segunda dirección es la que contiene 'ArrowTrading LLC' o similar
-            if re.search(r"ArrowTrading LLC", ln, re.I):
-                bill_to_idx = i
-                break
+        # 2. Aplicar una limpieza estricta (solo alfanumérico y un espacio opcional)
+        clean_match = re.match(r"([A-Z0-9]+\s*[A-Z0-9]*)", transport_no.strip(), re.I)
+
+        if clean_match:
+            transport_id_clean = clean_match.group(1)
+            # 3. Eliminar todos los espacios internos
+            transport_no = re.sub(r'\s+', '', transport_id_clean)
             
-        if bill_to_idx is not None:
-            # Dividir en el índice de la segunda dirección
-            ship_raw = "\n".join(lines[:bill_to_idx]).strip()
-            bill_raw = "\n".join(lines[bill_to_idx:]).strip()
-        else:
-            # Fallback a la lógica de City/State/Zip (aunque falló en el ejemplo)
-            city_state_zip_re = re.compile(r"[A-Za-z\s\.]+,\s*[A-Z]{2}\s*\d{5}", re.I)
-            city_indices = [i for i, ln in enumerate(lines) if city_state_zip_re.search(ln)]
+            # 4. Verificación final de longitud y exclusión (Mínimo 4 caracteres)
+            if len(transport_no) >= 4 and transport_no.upper() not in ["RAILCAR", "TRUCK", "VESSEL", "CUSTID", "NONE"]:
+                 return transport_no
+                 
+    return None
+# PASO 5
+def extract_totals(text):
+    # Nueva Regex: permite que la parte entera tenga dígitos, espacios, puntos o comas
+    # y termina con un punto y dos decimales.
+    # r"([\d\s,\.]+\.\d{2})"  <-- Esta es la clave
+    
+    # Explicación de la regex:
+    # (                 -> Inicio del grupo de captura
+    # [\d\s,\.]+        -> Coincide con uno o más dígitos, espacios, comas O PUNTOS (añadimos \.)
+    # \.                -> Coincide con el punto decimal final (escapado)
+    # \d{2}             -> Coincide con exactamente dos dígitos decimales
+    # )                 -> Fin del grupo de captura
 
-            if len(city_indices) >= 2:
-                split_at = city_indices[1]
-                ship_raw = "\n".join(lines[:split_at]).strip()
-                bill_raw = "\n".join(lines[split_at:]).strip()
-            else:
-                 # Fallback: dividir por la mitad
-                half = len(lines) // 2 or 1
-                ship_raw = "\n".join(lines[:half]).strip()
-                bill_raw = "\n".join(lines[half:]).strip()
+    subtotal_match = re.search(r"Subtotal\s*([\d\s,\.]+\.\d{2})", text, re.I)
+    total_match = re.search(r"TOTAL\s*([\d\s,\.]+\.\d{2})", text, re.I)
 
+    results = {}
+    
+    # El resto de la lógica de limpieza es crucial para el formato
+    
+    if subtotal_match:
+        # Capturamos y limpiamos
+        # Se debe limpiar *solo* lo que NO es el separador decimal final
+        subtotal_str = subtotal_match.group(1).strip()
+        # Elimina todos los puntos y comas *excepto* el último punto decimal (si está presente)
+        # Una forma más sencilla y segura para este formato es:
+        # 1. Eliminar espacios
+        # 2. Eliminar TODOS los separadores de miles (puntos y comas)
+        # 3. Reemplazar el último punto por un separador universal (por ejemplo, .)
+        
+        # Para el formato específico "114.371.50" (donde .50 son decimales)
+        # La forma más fácil es eliminar todos los separadores de miles (el primer punto)
+        # y dejar el separador decimal (el segundo punto).
+        
+        # Primero reemplazamos el *último* punto por un marcador temporal
+        # y luego eliminamos todos los demás puntos y comas.
+        
+        # Ya que la regex asegura que los últimos 3 caracteres son .\d{2},
+        # simplemente eliminamos todos los puntos y comas *previos* a esos 3 caracteres.
+        
+        # Estrategia de limpieza directa para `114.371.50`:
+        # Eliminamos el primer punto y el separador final es el punto decimal.
+        
+        # Capturamos el grupo:
+        valor_capturado = subtotal_match.group(1).strip()
+        
+        # Reemplazamos todos los puntos y comas con una cadena vacía, 
+        # *excepto* el que precede a los dos decimales.
+        
+        # Si eliminamos *todos* los puntos y comas (que es lo que hacías antes),
+        # obtenemos: "11437150"
+        
+        # Solución más limpia: Eliminar solo los separadores de miles.
+        subtotal_limpio = valor_capturado.replace(" ", "").replace(",", "")
+        
+        # Si el formato es "114.371.50" (donde el segundo punto es decimal)
+        # y el primer punto es de miles, simplemente eliminamos el primer punto.
+        # Esto es más complejo con regex. Mantengamos la limpieza simple y estandaricemos.
+        
+        # Lo que necesitas es que el resultado sea "114371.50"
+        # Simplificando la limpieza:
+        subtotal_str = subtotal_match.group(1).strip().replace(" ", "").replace(",", "")
+        # Si el número sigue conteniendo un punto (que es el separador decimal por la regex), lo dejamos.
+        
+        # Para tu caso "114.371.50" (el punto final es el decimal):
+        # 1. Eliminar comas y espacios: "114.371.50"
+        # 2. Reemplazar el punto de miles:
+        
+        # Una forma más segura para manejar el formato de múltiples puntos es
+        # eliminar todos los puntos EXCEPTO el último (el que la regex capturó como decimal)
+        
+        # Convertir a cadena y limpiar separadores de miles
+        valor_limpio = subtotal_match.group(1).strip().replace(" ", "")
+        
+        # Eliminar cualquier carácter que no sea dígito ni el último punto
+        # Usamos `re.sub` para reemplazar los separadores de miles (puntos o comas)
+        # que no estén inmediatamente antes de los dos decimales.
+        
+        # El método más directo (asumiendo que quieres el resultado en formato estándar):
+        # 1. Eliminar todos los separadores de miles (puntos y comas)
+        # 2. Asignar los últimos dos dígitos como decimales
+        
+        # Pero tu regex YA garantiza que los últimos tres caracteres son `.\d{2}`.
+        # Por lo tanto, solo tenemos que eliminar los separadores de miles *del resto del número*.
+        
+        # Simplificación: Asume que el último punto es el separador decimal, y todo lo demás
+        # (puntos, comas, espacios) son separadores de miles que deben ser eliminados.
+        
+        # 1. Reemplazar el punto decimal (el último) por un marcador temporal
+        valor_temp = subtotal_match.group(1).strip()
+        valor_temp = valor_temp[:-3].replace(".", "").replace(",", "").replace(" ", "") + valor_temp[-3:]
+        
+        # 2. El valor ahora está en formato '114371.50' (o '114371,50')
+        subtotal_num = safe_float_conversion(valor_temp)
+        results["Subtotal"] = subtotal_num
+    else:
+        results["Subtotal"] = None
+        
+    # Aplicar la misma lógica para el TOTAL
+    if total_match:
+        valor_temp = total_match.group(1).strip()
+        valor_temp = valor_temp[:-3].replace(".", "").replace(",", "").replace(" ", "") + valor_temp[-3:]
+        total_num = safe_float_conversion(valor_temp)
+        results["Total"] = total_num
+    else:
+        results["Total"] = None
+        
+    return results
 
-        data["Ship To"] = clean_address_block(ship_raw)
-        data["Bill To"] = clean_address_block(bill_raw)
-
-    elif is_coa:
-        # COA: CUSTOMER block
-        coa_match = re.search(r"CUSTOMER:(.*?)(?:LOT\s*NO|PRODUCT|DATE\s*SHIPPED)", full_text, re.I | re.DOTALL)
-        if coa_match:
-            data["Ship To"] = clean_address_block(coa_match.group(1).strip())
-
-        # ----------------------------------------------------------------------
-    # ---------- 4. EXTRAER INCOTERM, PAYMENT TERMS, FECHAS, METHOD (FINAL ROBUSTO) ----------
+def extract_invoice_data(pdf_path):
+    # ... (Inicialización de data) ...
+    data = {
+        "File": os.path.basename(pdf_path), 
+        "File_path": pdf_path,
+        "Invoice No": None,
+        "Invoice Date": None, 
+        "S/O#": None,
+        "Incotenn": None, 
+        "Payment Terms": None, 
+        "Ship Date": None, 
+        "Due Date": None,
+        "Method of Shipment": None,
+        "Ship To": None, 
+        "Bill To": None, 
+        "Subtotal": None, 
+        "Total": None,
+        "Product Details": []
+    }
+    # --- Lectura del texto (pdfplumber / OCR) ---
+    # CAMBIO: Recibe el texto completo y la lista de textos por página
+    full_text, pages_text = get_pdf_text_with_ocr_fallback(pdf_path)
     # ----------------------------------------------------------------------
+    # PASO CLAVE: Identificar la página de la factura
+    # ----------------------------------------------------------------------
+    text_for_address_and_terms = find_invoice_page_text(pages_text)
+    # Normalización del texto completo (para headers, detalles y totales)
+    full_text_norm = re.sub(r"\r", "\n", text_for_address_and_terms)
+    full_text_one = re.sub(r"[\r\n]+", " ", full_text_norm)
+    # ----------------------------------------------------------------------
+    # ---------- 1. HEADER (Invoice No, Invoice Date, S/O#) ----------
+    # ----------------------------------------------------------------------
+    # print(full_text)
+    headers = extract_headers(full_text_one) 
+    soNo = extract_so_no(full_text)
+    
+    data["Invoice No"] = headers.get("Invoice No")
+    data["Invoice Date"] = headers.get("Invoice Date")
+    data["S/O#"] = soNo.get("S/O NO")
 
-    results = extract_shipping_terms(full_text)
+    # ----------------------------------------------------------------------
+    # ---------- 2. EXTRAER Ship To / Bill To USANDO EL TEXTO DE LA PÁGINA DE LA FACTURA ----------
+    # ----------------------------------------------------------------------
+    addresses = extract_shipto_billto(full_text_one)
+    data["Ship To"] = addresses.get("Ship To")
+    data["Bill To"] = addresses.get("Bill To")
 
+    # ----------------------------------------------------------------------
+    # ---------- 3. EXTRAER INCOTERM, PAYMENT TERMS, FECHAS, METHOD USANDO EL TEXTO DE LA PÁGINA DE LA FACTURA ----------
+    # ----------------------------------------------------------------------
+    results = extract_shipping_terms(full_text_one)
     data["Incotenn"] = results.get("Incoterm")
     data["Payment Terms"] = results.get("Payment Terms")
     data["Ship Date"] = results.get("Ship Date")
     data["Due Date"] = results.get("Due Date")  
     data["Method of Shipment"] = results.get("Method of Shipment")
 
-    # ---------- 6. DETALLES DE PRODUCTO (No se requiere ajuste) ----------
-    # buscamos bloque entre encabezados Product No. ... Amount y el subtotal/TOTAL
-    prod_block_match = re.search(r"Product\s*No\..*?Amount\s*(.*?)\s*(?:Subtotal|TOTAL)", full_text, re.I | re.DOTALL)
-    if prod_block_match:
-        raw_block = prod_block_match.group(1)
-        # compactamos saltos y múltiples espacios
-        line_clean = re.sub(r"[\r\n]+", " ", raw_block)
-        line_clean = re.sub(r"\s{2,}", " ", line_clean).strip()
+    # ----------------------------------------------------------------------
+    # ---------- 4. DETALLES DE PRODUCTO (Utiliza full_text) ----------
+    # ----------------------------------------------------------------------
+    # print(full_text_one)
+    products = extract_product_detail(full_text_one)
+    railcar = extract_raildcar_v1(full_text)
+    products["Transport No."] = railcar
+    data['Product Details'] = [products]
 
-        # Patrón ajustado para ser más flexible si hay texto extra
-        product_pattern = re.compile(
-            r"([A-Z0-9\-]+)\s+([\d,]+)\s+([A-Za-z]+)\s+(.*?)\s+([\d\.]+)\s+([\d,\.]+)",
-            re.I
-        )
-        im = product_pattern.search(line_clean)
-        if im:
-            desc = re.sub(r'RAILCAR#.*|TRUCK.*', '', im.group(4), flags=re.I).strip()
-            data["Product Details"].append({
-                "Product No.": im.group(1).strip(),
-                "Item Qty": im.group(2).strip(),
-                "U/M": im.group(3).strip(),
-                "Description": desc,
-                "Transport No.": data.get("Transport No"),
-                "Price Each": im.group(5).strip(),
-                "Amount": im.group(6).strip()
-            })
-    elif is_coa:
-        # extraer producto y peso de COA
-        pm = re.search(r"PRODUCT\s*:\s*([A-Za-z0-9\s\-]+)\s+WEIGHT\s*\(LB\)\s*:\s*([\d,\.]+)", full_text, re.I)
-        if pm:
-            data["Product Details"].append({
-                "Product No.": None,
-                "Item Qty": pm.group(2).strip(),
-                "U/M": "LBS",
-                "Description": pm.group(1).strip(),
-                "Transport No.": data.get("Transport No"),
-                "Price Each": None,
-                "Amount": None
-            })
-
-    # ---------- 7. SUBTOTAL / TOTAL (No se requiere ajuste) ----------
-    sm = re.search(r"Subtotal\s*([\d,]+\.\d{2})", full_text, re.I)
-    tm2 = re.search(r"TOTAL\s*([\d,]+\.\d{2})", full_text, re.I)
-    if sm:
-        data["Subtotal"] = sm.group(1).strip()
-    if tm2:
-        data["Total"] = tm2.group(1).strip()
+    # ----------------------------------------------------------------------
+    # ---------- 5. SUBTOTAL / TOTAL (Utiliza full_text) ----------
+    # ----------------------------------------------------------------------
+    totals = extract_totals(full_text_one)
+    data["Subtotal"] = totals.get("Subtotal")
+    data["Total"] = totals.get("Total")
 
     # Resultado final (ordenado)
     output_keys = [
-        "File", "Invoice No", "Invoice Date", "S/O#", "Incotenn",
+        "File", "File_path", "Invoice No", "Invoice Date", "S/O#", "Incotenn",
         "Payment Terms", "Ship Date", "Due Date", "Method of Shipment",
         "Ship To", "Bill To", "Subtotal", "Total"
     ]
@@ -313,120 +839,3 @@ def extract_invoice_data(pdf_path):
     output["Product Details"] = data["Product Details"] if data["Product Details"] else []
 
     return output
-
-################################################################################################################
-################################################################################################################
-################################################################################################################
-
-# PRUEBAS
-
-folder_pdfs = r"C:\Users\obeli\Documents\admix_projects\python\pdf_reader\pdfs\procesables"
-
-def get_pdf_paths():
-    resultados = []
-    # Usando os.walk para incluir subcarpetas, o si solo quieres los de esa carpeta, usa os.listdir
-    for root, dirs, files in os.walk(folder_pdfs):
-        for nombre in files:
-            if nombre.lower().endswith(".pdf"):
-                ruta_completa = os.path.join(root, nombre)
-                # Con pathlib para partes más limpias
-                p = Path(ruta_completa)
-                nombre_sin_ext = p.stem       # nombre del archivo sin extensión
-                extension = p.suffix           # extensión (incluye el punto)
-                resultados.append({
-                    "ruta": ruta_completa,
-                    "nombre_con_ext": nombre,
-                    "nombre_sin_ext": nombre_sin_ext,
-                    "extension": extension
-                })
-    return resultados
-
-def validateInvoiceData(invoice_data):
-    """
-    Revisa el diccionario de datos extraídos para asegurarse de que no haya campos clave vacíos.
-    Devuelve una lista con los nombres de los campos que tienen datos faltantes.
-    """
-    campos_faltantes = []
-
-    # 1. Validar que el diccionario principal exista
-    if not invoice_data:
-        return ["Diccionario de datos vacío"]
-
-    # 2. Definir y validar los campos clave
-    # Puedes ajustar esta lista según qué campos consideres OBLIGATORIOS
-    campos_obligatorios = [
-        "Invoice No",
-        "Invoice Date",
-        "S/O#",
-        "Incotenn",
-        "Payment Terms",
-        "Bill To",
-        "Total"
-    ]
-
-    for campo in campos_obligatorios:
-        # Verifica si el valor es None o una cadena vacía ('' que también podría ser un valor "falsy")
-        if not invoice_data.get(campo):
-            campos_faltantes.append(campo)
-
-    # 3. Validar la lista de productos
-    if not invoice_data.get("Product Details"):
-        campos_faltantes.append("Product Details (lista vacía)")
-
-    # Opcional: Podrías validar también campos como "Subtotal" o "Ship To"
-    # if not invoice_data.get("Subtotal"):
-    #     campos_faltantes.append("Subtotal")
-
-    return campos_faltantes
-
-paths = get_pdf_paths()
-
-completos = 0
-incompletos = 0
-documents = paths[0:248]
-
-for info_pdf in documents:
-    # print(f"Procesando: {info_pdf['ruta']}")
-    
-    invoice = extract_invoice_data(info_pdf['ruta'])    
-    # "File", "Invoice No", "Invoice Date", "S/O#", "Incotenn", "Payment Terms", "Ship Date", "Due Date", "Method of Shipment", "Ship To", "Bill To", "Subtotal", "Total"
-    print(
-    f"{invoice.get('Invoice No')}\t|"
-    f"{invoice.get('Invoice Date')}\t|"
-    f"{invoice.get('S/O#')}\t|"
-    f"Incotenn: {invoice.get('Incotenn')}\t|"
-    f"PayTerms: {invoice.get('Payment Terms')}\t|"
-    f"Ship Date: {invoice.get('Ship Date')}\t|"
-    f"Due Date: {invoice.get('Due Date')}\t|"
-    f"MethodShipment: {invoice.get('Method of Shipment')}\t|"
-    f"{invoice.get('Subtotal')}\t|"
-    f"{invoice.get('Total')}\t|"
-    # f"{invoice.get('File')}"
-    )
-
-    secciones_faltantes = validateInvoiceData(invoice)
-    if not secciones_faltantes:
-        completos += 1
-    else:
-        print(f"⚠️ DATOS INCOMPLETOS en: {info_pdf['nombre_con_ext']}")
-        print(f"   Secciones con datos faltantes: {', '.join(secciones_faltantes)}")
-        incompletos += 1
-
-####### --- RESUMEN FINAL ---
-print("\n=============================================")
-print("📊 RESUMEN DEL PROCESAMIENTO")
-print("=============================================")
-print(f"  - Archivos completos:   {completos}")
-print(f"  - Archivos incompletos: {incompletos}")
-print(f"  - Total de archivos:    {len(documents)}")
-print("=============================================")
-
-################################################################################################################
-################################################################################################################
-################################################################################################################
-
-#PRUEBAS
-
-# pdf_file = r"c:\Users\obeli\Documents\admix_projects\python\pdf_reader\pdfs\procesables\41684C_P57A507.pdf"
-# result = extract_invoice_data(pdf_file)
-# print(json.dumps(result, indent=2))

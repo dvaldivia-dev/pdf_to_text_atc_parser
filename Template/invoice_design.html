@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Factura {Invoice No}</title>
+    <link rel="stylesheet" type="text/css" href="style.css" />
+  </head>
+  <body>
+    <div class="header-data">
+      <div class="invoice-title">INVOICE</div>
+      <div class="invoice-field">Invoice #: $Invoice_No</div>
+      <div class="invoice-field">Date: {Invoice_Date}</div>
+      <div class="invoice-field">S/O#: {S/O#}</div>
+    </div>
+
+    <div class="clear-float"></div>
+
+    <table class="address-container">
+      <tr>
+        <td>
+          <div class="address-title">BILL TO:</div>
+          <p>{Bill To}</p>
+        </td>
+        <td>
+          <div class="address-title">SHIP TO:</div>
+          <p>{Ship To}</p>
+        </td>
+      </tr>
+    </table>
+
+    <table class="product-table shipment-details">
+      <thead>
+        <tr>
+          <th>INCOTERM.</th>
+          <th>SHIP DATE</th>
+          <th>DUE DATE</th>
+          <th>SHIPPED VIA</th>
+          <th>TERMS</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>{Incotenn}</td>
+          <td>{Ship_Date}</td>
+          <td>{Due_Date}</td>
+          <td>{Method_of_Shipment}</td>
+          <td>{Payment_Terms}</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <table class="product-table">
+      <thead>
+        <tr>
+          <th>Product No.</th>
+          <th>Description</th>
+          <th>Qty ({Product U/M})</th>
+          <th class="align-right">Price Each</th>
+          <th class="align-right">Amount</th>
+        </tr>
+      </thead>
+      <tbody>
+        {Product Rows}
+      </tbody>
+    </table>
+
+    <div class="totals-container">
+      <table class="totals-table">
+        <tr>
+          <td class="total-label">Subtotal:</td>
+          <td class="total-value">{Subtotal}</td>
+        </tr>
+        <tr class="final-total">
+          <td class="total-label">TOTAL:</td>
+          <td class="total-value">{Total}</td>
+        </tr>
+      </table>
+    </div>
+  </body>
+</html>

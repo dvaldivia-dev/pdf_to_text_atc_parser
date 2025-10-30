@@ -2,3 +2,6 @@
 debug_imagen.png
 texto_ocr.txt
 invoices_header_shipto.xlsx
+processed_emails.json
+config.json
+processed_pdfs.json
