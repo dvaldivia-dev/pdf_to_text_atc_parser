@@ -144,17 +144,29 @@ def remove_invoice_page(pdf_path, output_path):
     with open(output_path, "wb") as f:
         writer.write(f)
 
-def load_processed_pdfs(file_path="processed_pdfs.json"):
+def save_processed_pdfs(processed_set, file_path="temp/processed_pdfs.json"):
+    """Guarda la lista de PDFs procesados en un archivo JSON y crea la carpeta temp si no existe."""
+    
+    # 1. Obtener el directorio del archivo (ejemplo: 'temp')
+    directory = os.path.dirname(file_path)
+    
+    # 2. Crear el directorio si no existe
+    if directory and not os.path.exists(directory):
+        # 'exist_ok=True' evita un error si por alguna razón la carpeta ya se creó
+        # 'os.makedirs' puede crear directorios anidados si fuera necesario
+        os.makedirs(directory, exist_ok=True) 
+
+    # 3. Guardar el archivo
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(list(processed_set), f, indent=2)
+
+# ... tu función load_processed_pdfs sigue igual ...
+def load_processed_pdfs(file_path="temp/processed_pdfs.json"):
     """Carga la lista de PDFs procesados desde un archivo JSON."""
     if os.path.exists(file_path):
         with open(file_path, "r", encoding="utf-8") as f:
             return set(json.load(f))
     return set()
-
-def save_processed_pdfs(processed_set, file_path="processed_pdfs.json"):
-    """Guarda la lista de PDFs procesados en un archivo JSON."""
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(list(processed_set), f, indent=2)
 
 def read_pdfs_files(folder_pdfs):
     paths = get_pdf_paths(folder_pdfs)

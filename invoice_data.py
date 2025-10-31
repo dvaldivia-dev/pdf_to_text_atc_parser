@@ -3,10 +3,7 @@ import cv2
 import numpy as np
 import re
 from re import I, DOTALL
-from pathlib import Path
-from datetime import datetime, timedelta
 import pdfplumber
-from findimagespdf.pdffile import PDFFile
 import pdfplumber
 from pdf2image import convert_from_path
 import pytesseract

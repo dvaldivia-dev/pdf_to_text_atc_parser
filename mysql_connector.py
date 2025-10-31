@@ -8,7 +8,7 @@ DB_CONFIG = {
     'host': 'localhost', #192.168.0.99 <--- Server 99
     'database': 'atc',
     'user': 'root',
-    'password': 'Kr3st0n000', #Kr3st0n <--- contraseña mysql server 99
+    'password': 'Kr3st0n', #Kr3st0n <--- contraseña mysql server 99
 }
 # --------------------------------------------------------
 def insert_invoice_with_connection(conn, invoice_data: dict):

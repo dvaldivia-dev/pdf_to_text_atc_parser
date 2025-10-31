@@ -135,15 +135,34 @@ def build_search_criteria(date_start, date_end=None, from_filter=None):
 
 # HISTORY JSON helpers
 def load_history(path):
+    """
+    Carga el historial desde un archivo JSON. 
+    Devuelve un diccionario vacío si el archivo no existe o está corrupto.
+    """
     if not os.path.exists(path):
         return {}
+    
     with open(path, "r", encoding="utf-8") as f:
         try:
             return json.load(f)
         except json.JSONDecodeError:
+            # Maneja el caso de que el archivo exista pero esté vacío o malformado
             return {}
 
 def save_history(history, path):
+    """
+    Guarda el historial en un archivo JSON. 
+    Asegura que el directorio del archivo exista antes de escribir.
+    """
+    # 1. Obtener el directorio del archivo (e.g., 'data' de 'data/history.json')
+    directory = os.path.dirname(path)
+    
+    # 2. Crear el directorio si es necesario
+    if directory:
+        # Crea el/los directorio/s. 'exist_ok=True' evita un error si ya existe.
+        os.makedirs(directory, exist_ok=True)
+        
+    # 3. Guardar el archivo
     with open(path, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=4, ensure_ascii=False)
 
