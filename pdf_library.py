@@ -1,10 +1,19 @@
-
 import os
 import re
 from xhtml2pdf import pisa
 from string import Template 
+from pypdf import PdfReader, PdfWriter
+import pytesseract
+import os
+import re
+import shutil
+import json
+import hashlib
+from commons import get_pdf_paths
+from invoice_data import extract_invoice_data
+from invoice_data import find_invoice_page_index, get_pdf_text_with_ocr_fallback
 
-# --- CONFIGURACIÓN DE RUTAS ---
+# --------------------------- CREAR PDF CON HTML -------------------------------------
 # Obtiene la ruta base del script (ruta de la carpeta actual)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__)) 
 
@@ -21,8 +30,6 @@ def link_callback(uri, rel):
     
     # Devuelve la URI original si no se encuentra
     return uri 
-
-# --- FUNCIÓN PRINCIPAL ---
 
 def crear_pdf_factura_desde_archivo(nombre_archivo_pdf: str, invoice_data: dict, template_path: str) -> bool:
     """
@@ -96,29 +103,125 @@ def crear_pdf_factura_desde_archivo(nombre_archivo_pdf: str, invoice_data: dict,
     except Exception as e:
         print(f"❌ Error general al crear el PDF: {e}")
         return False
-# Ejemplo de uso
-invoice_data = {
-    'Invoice No': '41494J', 
-    'Invoice Date': '1/23/25', 
-    'S/O#': 'P51A601', 
-    'Ship To': '...', 
-    'Bill To': '...', 
-    'Subtotal': '111291.25', 
-    'Total': '111291.25',
-    'Incotenn': 'DAP: LEON, GTO', 
-    'Payment Terms': 'Net 60 Days', 
-    'Ship Date': '1/23/25', 
-    'Due Date': '3/24/25', 
-    'Method of Shipment': 'RAILCAR',
-    'Product Details': [
-        {'Product No.': '5102KR', 'Item Qty': '193,550', 'U/M': 'LBS', 'Description': 'Polypropylene', 'Price Each': '0.57500', 'Amount': '111,291.25'}
-    ]
-}
 
-TEMPLATE_FILE = 'invoice_design.html'
 
-crear_pdf_factura_desde_archivo(
-    f"Factura_{invoice_data['Invoice No']}_Final.pdf", 
-    invoice_data, 
-    TEMPLATE_FILE
-)
+# --------------------------- FUNCIÓN PRINCIPAL ----------------------------------------
+
+def normalize_invoice(invoice):
+    def normalize_value(v):
+        if isinstance(v, str):
+            v = re.sub(r'\s+', ' ', v.strip())  # quita espacios y saltos de línea extra
+        elif isinstance(v, list):
+            return [normalize_value(i) for i in v]
+        elif isinstance(v, dict):
+            return {k: normalize_value(vv) for k, vv in v.items()}
+        return v
+
+    return normalize_value(invoice)
+
+def remove_invoice_page(pdf_path, output_path):
+    """
+    Crea una copia del PDF sin la página que contiene los datos del invoice.
+    Usa OCR si es necesario.
+    """
+    _, pages_text_list = get_pdf_text_with_ocr_fallback(pdf_path)
+
+    if not pages_text_list:
+        print(f"⚠️ No se pudo extraer texto del PDF: {pdf_path}")
+        shutil.copy2(pdf_path, output_path)
+        return
+
+    # Detectar índice de la página del invoice
+    invoice_page_index = find_invoice_page_index(pages_text_list)
+
+    reader = PdfReader(pdf_path)
+    writer = PdfWriter()
+
+    for i, page in enumerate(reader.pages):
+        if i != invoice_page_index:  # omitimos la página de factura
+            writer.add_page(page)
+
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+def load_processed_pdfs(file_path="processed_pdfs.json"):
+    """Carga la lista de PDFs procesados desde un archivo JSON."""
+    if os.path.exists(file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    return set()
+
+def save_processed_pdfs(processed_set, file_path="processed_pdfs.json"):
+    """Guarda la lista de PDFs procesados en un archivo JSON."""
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(list(processed_set), f, indent=2)
+
+def read_pdfs_files(folder_pdfs):
+    paths = get_pdf_paths(folder_pdfs)
+
+    ######################### PATHS ########################
+    originPathPDF = os.path.join(folder_pdfs, "origin")
+    attachmentsPathPDF = os.path.join(folder_pdfs, "attachment")
+
+    # Crear las carpetas si no existen
+    os.makedirs(originPathPDF, exist_ok=True)
+    os.makedirs(attachmentsPathPDF, exist_ok=True)
+
+    completos = 0
+    incompletos = 0
+    lista_objetos = []
+    # ✅ Cargar PDFs ya procesados previamente
+    processed_hashes = load_processed_pdfs()
+    print(f"Numero de archivos encontrados: {len(paths)}")
+    for indice, info_pdf in enumerate(paths[:len(paths)]):
+        pdf_path = info_pdf['ruta']
+        pdf_filename = os.path.basename(pdf_path)
+
+        invoice = extract_invoice_data(pdf_path)
+        invoice = normalize_invoice(invoice)
+        completos += 1
+
+        clave_unica = json.dumps({
+            'Invoice No': invoice.get('Invoice No'),
+            'Invoice Date': invoice.get('Invoice Date'),
+            'S/O#': invoice.get('S/O#'),
+            'Incotenn': invoice.get('Incotenn'),
+            'Payment Terms': invoice.get('Payment Terms'),
+            'Ship Date': invoice.get('Ship Date'),
+            'Due Date': invoice.get('Due Date'),
+            'Method of Shipment': invoice.get('Method of Shipment'),
+            'Subtotal': invoice.get('Subtotal'),
+            'Total': invoice.get('Total'),
+        }, sort_keys=True)
+
+        
+        hash_obj = hashlib.sha256(clave_unica.encode()).hexdigest()
+
+        if hash_obj in processed_hashes:
+            incompletos += 1
+            continue
+
+        # print(f"{indice}| Ship Date: {invoice['Ship Date']} | Due Date: {invoice['Due Date']} | {invoice['File']}")
+        print(f"{indice}| Procesando: Invoice No: {invoice['Invoice No']} | Invoice Date: {invoice['Invoice Date']} | {invoice['File']}")
+        # Agregamos al conjunto de únicos      
+        processed_hashes.add(hash_obj)
+        
+        destino_origin = os.path.join(originPathPDF, pdf_filename)
+        destino_attachment = os.path.join(attachmentsPathPDF, pdf_filename)
+
+        # Agregamos la ruta al objeto
+        invoice['originPath'] = destino_origin
+        invoice['attachmentPath'] = destino_attachment
+        es_arrow_ship_to = 1 if invoice['Ship To'].lower().startswith("arrow") else 0
+        invoice['needs_review'] = es_arrow_ship_to
+
+        ## print(invoice)
+        lista_objetos.append(invoice)
+
+        ##Mover el original a origin
+        shutil.move(pdf_path, destino_origin)
+        remove_invoice_page(destino_origin, destino_attachment)
+    
+    # ✅ Guardar el registro actualizado
+    save_processed_pdfs(processed_hashes)
+    return lista_objetos

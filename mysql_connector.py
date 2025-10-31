@@ -5,10 +5,10 @@ from commons import format_date_to_sql
 
 # --- CONFIGURACIÓN DE LA BASE DE DATOS (al servidor 99) ---
 DB_CONFIG = {
-    'host': '192.168.0.99', #localhost <--- Solo para pruebas en maquina local
+    'host': 'localhost', #192.168.0.99 <--- Server 99
     'database': 'atc',
     'user': 'root',
-    'password': 'Kr3st0n000', #Kr3st0n
+    'password': 'Kr3st0n000', #Kr3st0n <--- contraseña mysql server 99
 }
 # --------------------------------------------------------
 def insert_invoice_with_connection(conn, invoice_data: dict):
