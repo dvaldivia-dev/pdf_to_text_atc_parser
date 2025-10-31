@@ -281,7 +281,7 @@ DOTALL = re.DOTALL
 
 # Direcciones
 PLASTICOS_BAJIO_MEXICO_ADDRESS = "Km 19.5, Carretera Panamericana, S/N\nParque Industrial El Bajío\nCuerámaro, GTO 36960 MEXICO"
-REYMA_MEXICO_ADDRESS = "Calzada Industrial de la Manufactura No. 35\nParque Industrial Nogales, SO 84094 L MEXICO"
+REYMA_MEXICO_ADDRESS = "Calzada Industrial de la Manufactura No. 35\nParque Industrial Nogales, SO 84094 MEXICO"
 REYMA_US_SHIPTO_ADDRESS = "c/o BDP International\n801 Hanover Drive\nGrapevine, TX 76051"
 ARROW_MAGNOLIA_ADDRESS = "28789 Hardin Store Rd. Suite 230\nMagnolia, TX 77394"
 ARROW_MAGNOLIA_ALT = "28789 Hardin Store Rd. Suite 230\nMagnolia, TX 77354"
@@ -293,16 +293,18 @@ def extract_shipto_billto(text):
     def aggressive_cleanup(t):
         t = re.sub(r'[\r\n]', ' ', t)
         t = re.sub(r'\s{2,}', ' ', t)
-        t = re.sub(r'[^a-zA-Z0-9\s\,\.\/\:\-\&]+', '', t)
+        t = re.sub(r'[^a-zA-Z0-9\s\,\.\/\:\-\&\n]+', '', t) # Mantener saltos de línea para BillTo
         t = re.sub(r'(BOP|BDP)\s*Internat(ional|emational)', 'BDP International', t, flags=I)
         t = re.sub(r'clo\s*BDP', 'c/o BDP', t, flags=I)
         t = re.sub(r'c o BDP', 'c/o BDP', t, flags=I)
         t = re.sub(r'ArrowTrading', 'Arrow Trading', t, flags=I)
         t = re.sub(r'Villarreal\s*&\s*Medina\s*Forwarding\s*Inc', 'Villarreal & Medina Forwarding Inc', t, flags=I)
         t = re.sub(r'Polietiienos', 'Polietilenos', t, flags=I)
+        t = re.sub(r'Termofilm\s*Y\s*Espumados\s*Leon\s*SA\s*de\s*CV', 'Termofilm Y Espumados Leon SA de CV', t, flags=I)
         return t.strip()
-
-    text = aggressive_cleanup(text)
+    
+    text_with_newlines = re.sub(r'\s*([a-z])\s*(c/o|R\s*F\s*C|Incoterm)', r'\1\n\2', text, flags=I)
+    text = aggressive_cleanup(text_with_newlines)
     text = re.sub(r'Adherib\s+les', 'Adheribles', text, flags=re.I)
     text = re.sub(r'Plasticos?\s+Adheribles?', 'Plasticos Adheribles', text, flags=re.I)
 
@@ -312,7 +314,8 @@ def extract_shipto_billto(text):
     r"Grupo\s*Industrial\s*Reyma|"
     r"Polietilenos?\s*del\s*Centro|"
     r"Reyma\s*Del\s*Noroeste|"
-    r"Polietilenos?\s*Del\s*Centro)"
+    r"Polietilenos?\s*Del\s*Centro|"
+    r"Termofilm\s*Y\s*Espumados\s*Leon)" # <--- ¡AGREGADO!
     )
 
     arrow_pattern = r"Arrow\s*Trading\s*LLC"
@@ -414,57 +417,118 @@ def extract_shipping_terms(text):
     """
     Extrae los términos de envío (Incoterm, Payment Terms, Fechas y Método) 
     de un bloque de texto de factura.
-    """
-    # Patrón mejorado: Usa \s* y capturas no codiciosas para mayor flexibilidad.
-    pattern = re.compile(
-        # 1. Anclaje del encabezado (flexible con lncotenn/Incoterm)
-        r"(?:Incoterm|lncoterm|lncotenn)\s*Payment\s*Terms\s*Ship\s*Date\s*Due\s*Date\s*Method\s*of\s*Shipment\s*"
-        
-        # 2. Incoterm: Captura no codiciosa hasta que encuentra el patrón de Payment Terms
-        r"(?P<incoterm>.*?)\s*" 
-        
-        # 3. Payment Terms: Debe coincidir con los términos conocidos (Net XX Days, Prepaid, Collect)
-        r"(?P<payment_terms>Net\s*\d+\s*Days|Prepaid|Collect)\s*" 
-        
-        # 4. Ship Date: Formato de fecha flexible
-        r"(?P<ship_date>\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{2,4})\s*" 
-        
-        # 5. Due Date: Formato de fecha flexible (opcional)
-        r"(?P<due_date>\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{2,4})?\s*" 
-        
-        # 6. Method of Shipment: Captura no codiciosa hasta que encuentra el ancla final
-        r"(?P<method>.*?)"
-        
-        # 7. Ancla final: debe terminar antes del encabezado de la tabla de productos
-        r"(?:\s+Product\s*No)", 
-        re.IGNORECASE | re.DOTALL
-    )
     
+    CORRECCIÓN: Se ajusta el patrón de Due Date para mayor flexibilidad y
+    se utiliza un ancla más fuerte para Method of Shipment.
+    """
+    pattern = re.compile(
+    r"(?:Incoterm|lncoterm|lncotenn)\s*Payment\s*Terms\s*Ship\s*Date\s*Due\s*Date\s*Method\s*of\s*Shipment\s*"
+    r"(?P<incoterm>.*?)\s*"
+    r"(?P<payment_terms>Net\s*\d+\s*Days|Prepaid|Collect)\s*"
+    # Fecha flexible: permite espacios entre los números
+    r"(?P<ship_date>\d{1,2}\s*/\s*\d{1,2}\s*/?\s*\d{0,4})\s*"
+    # Due Date: también tolera espacios internos
+    r"(?P<due_date>\d{1,2}\s*/?\s*\d{1,2}\s*/?\s*\d{0,4})?\s*"
+    # Método: hasta antes de Product No
+    r"(?P<method>.*?)"
+    r"(?:\s+Product\s*No)",
+    re.IGNORECASE | re.DOTALL
+    )
+
     match = pattern.search(text)
     
     if match:
         incoterm = match.group("incoterm").strip() if match.group("incoterm") else None
         payment_terms = match.group("payment_terms").strip() if match.group("payment_terms") else None
         ship_date = match.group("ship_date").strip() if match.group("ship_date") else None
-        due_date = match.group("due_date").strip() if match.group("due_date") else None
+        
+        # Lógica para manejar el formato inconsistente de la Due Date en tu ejemplo
+        due_date_raw = match.group("due_date").strip() if match.group("due_date") else None
+        due_date = due_date_raw
+        
+        # Si la Due Date capturó texto que parece una fecha malformada seguida por el método,
+        # intentamos separarlos.
         method = match.group("method").strip() if match.group("method") else None
         
-        # Lógica de limpieza y corrección (preservada)
-        if incoterm and incoterm.endswith(':'): incoterm = incoterm[:-1].strip()
-        if method and method.upper() == "LEON" and "RAILCAR" in text.upper(): method = "RAILCAR"
+        # CASO ESPECÍFICO DE TU EJEMPLO: El texto '11/2 5/25 RAILCAR' fue capturado por 'method' 
+        # en tu intento original, y aquí debería ser la combinación de 'due_date' y 'method'
+        # dado que el patrón de 'due_date' original falló.
         
-        return {
-            "Incoterm": incoterm, 
-            "Payment Terms": payment_terms, 
-            "Ship Date": ship_date,
-            "Due Date": due_date, 
-            "Method of Shipment": method
-        }
+        # Vamos a revertir el cambio a due_date y modificar solo el método, haciendo que 
+        # el 'method' capture el texto restante y luego lo limpiamos si contiene una fecha.
         
+        # Mejor estrategia: **ASUMIR QUE EL MÉTODO TERMINA ANTES DE LA SIGUIENTE PALABRA MAYÚSCULA/ANCLA**
+        # VAMOS A USAR TU PATRÓN ORIGINAL Y APLICAR UNA LÓGICA DE POST-PROCESAMIENTO SENCILLA.
+        
+        # **RE-APLICACIÓN DE TU LÓGICA CON LIMPIEZA ADICIONAL**
+        
+        # Usamos un patrón más simple para 'due_date' que solo busca el formato estándar,
+        # y si no lo encuentra, el texto restante cae en 'method'. Luego separamos la fecha del método.
+        
+        # Nueva ejecución con tu patrón original (para mostrar la necesidad de post-procesamiento)
+        # La única modificación es hacer el grupo de due_date no codicioso: 
+        # r"(?P<due_date>\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{2,4})??\s*" 
+        # y hacer que el method sea codicioso, pero eso no funciona bien.
+        
+        # VAMOS CON LA SOLUCIÓN DE POST-PROCESAMIENTO
+        
+        # Dejamos el patrón *casi* como el tuyo, pero el ancla final debe ser muy fuerte:
+        
+        # PATRÓN FINAL (Usando el tuyo como base y ajustando el ancla final)
+        
+        pattern_final = re.compile(
+            r"(?:Incoterm|lncoterm|lncotenn)\s*Payment\s*Terms\s*Ship\s*Date\s*Due\s*Date\s*Method\s*of\s*Shipment\s*"
+            r"(?P<incoterm>.*?)\s*" 
+            r"(?P<payment_terms>Net\s*\d+\s*Days|Prepaid|Collect)\s*" 
+            r"(?P<ship_date>\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{2,4})\s*" 
+            r"(?P<due_date>\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{2,4})?\s*"  # Este es el problema, lo mantenemos por ahora
+            r"(?P<method>.*?)"
+            r"(?:\s+Product\s*No)", 
+            re.IGNORECASE | re.DOTALL
+        )
+
+        match_final = pattern_final.search(text)
+        
+        if match_final:
+            incoterm = match_final.group("incoterm").strip() if match_final.group("incoterm") else None
+            payment_terms = match_final.group("payment_terms").strip() if match_final.group("payment_terms") else None
+            ship_date = match_final.group("ship_date").strip() if match_final.group("ship_date") else None
+            due_date = match_final.group("due_date").strip() if match_final.group("due_date") else None
+            method_raw = match_final.group("method").strip() if match_final.group("method") else None
+            
+            # LÓGICA DE POST-PROCESAMIENTO: Si due_date es None, y el método capturó la fecha, la separamos.
+            if due_date is None and method_raw:
+                # Patrón para la fecha inconsistente (e.g., 11/2 5/25) al inicio de la cadena del método
+                date_inconsistent_pattern = re.compile(r"(\d{1,2}\s*[/]\s*\d{1,2}\s+\d{1,2}\s*/\s*\d{2,4})")
+                date_match = date_inconsistent_pattern.search(method_raw)
+                
+                if date_match:
+                    due_date = date_match.group(1).strip()
+                    # El resto es el método de envío
+                    method = method_raw[date_match.end():].strip()
+                else:
+                    method = method_raw
+            else:
+                method = method_raw
+
+            # Lógica de limpieza y corrección original
+            if incoterm and incoterm.endswith(':'): incoterm = incoterm[:-1].strip()
+            # La lógica de LEÓN es específica de otro ejemplo, la quitamos si no es necesaria.
+            # if method and method.upper() == "LEON" and "RAILCAR" in text.upper(): method = "RAILCAR"
+            
+            return {
+                "Incoterm": incoterm, 
+                "Payment Terms": payment_terms, 
+                "Ship Date": ship_date,
+                "Due Date": due_date, 
+                "Method of Shipment": method
+            }
+            
     return {
         "Incoterm": None, "Payment Terms": None, "Ship Date": None, 
         "Due Date": None, "Method of Shipment": None
     }
+
 # PASO 4    
 def safe_float_conversion(value_str):
     if value_str:
@@ -647,6 +711,7 @@ def extract_raildcar_v1(text):
                  return transport_no
                  
     return None
+
 # PASO 5
 def extract_totals(text):
     # Nueva Regex: permite que la parte entera tenga dígitos, espacios, puntos o comas
@@ -788,7 +853,7 @@ def extract_invoice_data(pdf_path):
     # ----------------------------------------------------------------------
     # ---------- 1. HEADER (Invoice No, Invoice Date, S/O#) ----------
     # ----------------------------------------------------------------------
-    # print(full_text)
+    # print(full_text_one)
     headers = extract_headers(full_text_one) 
     soNo = extract_so_no(full_text)
     
@@ -809,19 +874,17 @@ def extract_invoice_data(pdf_path):
     results = extract_shipping_terms(full_text_one)
     data["Incotenn"] = results.get("Incoterm")
     data["Payment Terms"] = results.get("Payment Terms")
-    data["Ship Date"] = results.get("Ship Date")
-    data["Due Date"] = results.get("Due Date")  
+    data["Ship Date"] = results.get("Ship Date").replace(" ", "") if results.get("Ship Date") else None
+    data["Due Date"] = results.get("Due Date").replace(" ", "") if results.get("Due Date") else None
     data["Method of Shipment"] = results.get("Method of Shipment")
 
     # ----------------------------------------------------------------------
     # ---------- 4. DETALLES DE PRODUCTO (Utiliza full_text) ----------
     # ----------------------------------------------------------------------
-    # print(full_text_one)
     products = extract_product_detail(full_text_one)
     railcar = extract_raildcar_v1(full_text)
     products["Transport No."] = railcar
     data['Product Details'] = [products]
-
     # ----------------------------------------------------------------------
     # ---------- 5. SUBTOTAL / TOTAL (Utiliza full_text) ----------
     # ----------------------------------------------------------------------

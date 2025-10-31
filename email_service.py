@@ -1,8 +1,6 @@
-import json
 import pytesseract
-import os
-import sys
 import re
+import time
 import imaplib
 from commons import build_search_criteria, load_history, save_history, already_processed, save_attachment, decode_mime_words
 import email
@@ -10,43 +8,60 @@ from email import policy
 import traceback
 from email_library import load_config
 
-from invoice_data import extract_headers, find_invoice_page_text, get_pdf_text_with_ocr_fallback_v1
-from read_file_information import read_pdfs_files
+from invoice_data import extract_headers, find_invoice_page_text, get_pdf_text_with_ocr_fallback
+from read_file_information import main_orchestrator
 
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-
-
 def process_mailbox(imap, cfg):
-    imap.select(cfg["mailbox"])
-    search_query = build_search_criteria(cfg["date_start"], cfg["date_end"],cfg["search_by"] )
-    print(f"Buscando correos con criterio: {search_query}")
+    try:
+        imap.select(cfg["mailbox"])
+    except imaplib.IMAP4.abort as e:
+        print(f"⚠️ Error al seleccionar el buzón ({e}), reintentando conexión...")
+        time.sleep(2)
+        imap.noop()
+        imap.select(cfg["mailbox"])
+
+    search_query = build_search_criteria(cfg["date_start"], cfg["date_end"], cfg["search_by"])
+    print(f"🔍 Buscando correos con criterio: {search_query}")
+
     typ, data = imap.search(None, search_query)
     if typ != "OK":
-        print("Error buscando correos:", typ, data)
+        print("❌ Error buscando correos:", typ, data)
         return
 
     msg_nums = data[0].split()
-    print(f"Correos encontrados: {len(msg_nums)}")
+    print(f"📬 Correos encontrados: {len(msg_nums)}")
 
     history = load_history(cfg["history_file"])
 
     for num in msg_nums:
         downloaded_pdfs = []
         try:
-            typ, msg_data = imap.fetch(num, "(RFC822)")
+            # --- 🔁 Reintento robusto de fetch ---
+            for intento in range(3):
+                try:
+                    typ, msg_data = imap.fetch(num, "(RFC822)")
+                    if typ == "OK":
+                        break
+                except imaplib.IMAP4.abort as e:
+                    print(f"⚠️ Error IMAP ({e}), reintentando {intento + 1}/3 ...")
+                    time.sleep(2)
+                    imap.noop()
+                    if intento == 2:
+                        raise  # después de 3 intentos fallidos, abortar
+
             if typ != "OK":
+                print(f"❌ No se pudo obtener el correo #{num}. Se omite.")
                 continue
 
             raw = msg_data[0][1]
             msg = email.message_from_bytes(raw, policy=policy.default)
 
-            msg_id = msg.get("Message-ID", "").strip()
-            if not msg_id:
-                msg_id = f"NOID-{num.decode() if isinstance(num, bytes) else num}"
+            msg_id = msg.get("Message-ID", "").strip() or f"NOID-{num.decode() if isinstance(num, bytes) else num}"
 
             if already_processed(history, msg_id):
-                print(f"⏭️  Correo ya procesado ({msg_id}), se omite.")
+                print(f"⏭️ Correo ya procesado ({msg_id}), se omite.")
                 continue
 
             subject = decode_mime_words(msg.get("Subject", ""))
@@ -58,47 +73,36 @@ def process_mailbox(imap, cfg):
             print(f"   Fecha: {date_}")
 
             found_any_pdf = False
+
             if msg.is_multipart():
                 for part in msg.walk():
-                    try: 
+                    try:
                         filename = part.get_filename()
                         if not filename:
                             continue
-                        
                         filename = decode_mime_words(filename)
                         ctype = part.get_content_type()
-                        
+
                         if ctype == "application/pdf" or filename.lower().endswith(".pdf"):
                             payload = part.get_payload(decode=True)
-                            
-                            # Lógica que puede fallar (lectura, OCR, extracción de headers)
-                            text, pages_text = get_pdf_text_with_ocr_fallback_v1(payload)
+                            text, pages_text = get_pdf_text_with_ocr_fallback(payload)
                             invoiceData = find_invoice_page_text(pages_text)
                             invoice_norm = re.sub(r"\r", "\n", invoiceData)
                             full_text_one = re.sub(r"[\r\n]+", " ", invoice_norm)
                             headers = extract_headers(full_text_one)
-                            
-                            # Lógica de nomenclatura (ya ajustada)
+
                             invoice_number = headers.get("Invoice No", "")
-                            
-                            if invoice_number:
-                                prefix = invoice_number + "_"
-                            else:
-                                prefix = ""
-                                
+                            prefix = f"{invoice_number}_" if invoice_number else ""
                             new_filename = prefix + filename
-                            
-                            # Guardado
+
                             saved_path = save_attachment(payload, new_filename, cfg["download_folder"])
                             print(f"  ✅ PDF guardado: {saved_path}")
                             downloaded_pdfs.append(new_filename)
                             found_any_pdf = True
 
                     except Exception as e:
-                        # Si este PDF falla, imprimimos el error y el bucle continúa
-                        # con el siguiente 'part' (otro adjunto) del mismo correo.
-                        print(f"  ❌ ERROR al procesar o guardar el PDF '{filename}': {e}. Se omite este adjunto.")
-                        # Opcional: traceback.print_exc() si necesitas el stack trace completo aquí.
+                        print(f"  ❌ ERROR al procesar o guardar el PDF '{filename}': {e}")
+                        traceback.print_exc()
 
             if not found_any_pdf:
                 print("   ⚠️ No se encontraron PDFs en este correo.")
@@ -115,8 +119,16 @@ def process_mailbox(imap, cfg):
             if cfg.get("mark_as_seen"):
                 imap.store(num, '+FLAGS', '\\Seen')
 
+        except imaplib.IMAP4.abort as e:
+            print(f"🚨 Error grave IMAP durante el procesamiento: {e}")
+            time.sleep(3)
+            try:
+                imap.noop()
+            except Exception:
+                print("⚠️ La sesión IMAP parece haber expirado. Reconectando...")
+                # reconnect_imap(imap, cfg)  # puedes implementar esta helper si quieres reconectar
         except Exception as e:
-            print("❌ Error procesando correo:", e)
+            print(f"❌ Error procesando correo: {e}")
             traceback.print_exc()
 
 def main():
@@ -151,6 +163,6 @@ def main():
     print("#######################################################################################################")
     print("Leyendo archivos para extraer su información")
     print("#######################################################################################################")
-    read_pdfs_files(cfg["download_folder"])
+    main_orchestrator(cfg["download_folder"])
 
 main()

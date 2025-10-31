@@ -5,24 +5,20 @@ from email import policy
 from email.header import decode_header
 import datetime
 
+ # Usando os.walk para incluir subcarpetas, o si solo quieres los de esa carpeta, usa os.listdir
 
 def get_pdf_paths(path):
     resultados = []
-    # Usando os.walk para incluir subcarpetas, o si solo quieres los de esa carpeta, usa os.listdir
-    for root, dirs, files in os.walk(path):
-        for nombre in files:
-            if nombre.lower().endswith(".pdf"):
-                ruta_completa = os.path.join(root, nombre)
-                # Con pathlib para partes más limpias
-                p = Path(ruta_completa)
-                nombre_sin_ext = p.stem       # nombre del archivo sin extensión
-                extension = p.suffix           # extensión (incluye el punto)
-                resultados.append({
-                    "ruta": ruta_completa,
-                    "nombre_con_ext": nombre,
-                    "nombre_sin_ext": nombre_sin_ext,
-                    "extension": extension
-                })
+    carpeta = Path(path)
+    
+    for archivo in carpeta.iterdir():  # Solo recorre archivos/directorios directos
+        if archivo.is_file() and archivo.suffix.lower() == ".pdf":
+            resultados.append({
+                "ruta": str(archivo),
+                "nombre_con_ext": archivo.name,
+                "nombre_sin_ext": archivo.stem,
+                "extension": archivo.suffix
+            })
     return resultados
 
 def validateInvoiceData(invoice_data):

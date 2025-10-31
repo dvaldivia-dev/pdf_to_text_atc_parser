@@ -8,7 +8,7 @@ import hashlib
 from commons import get_pdf_paths
 from invoice_data import extract_invoice_data
 from invoice_data import find_invoice_page_index, get_pdf_text_with_ocr_fallback
-from mysql_connector import get_db_connection, insert_invoice_with_connection_v2
+from mysql_connector import get_db_connection, insert_invoice_with_connection
 
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
@@ -77,7 +77,8 @@ def read_pdfs_files(folder_pdfs):
     lista_objetos = []
     # ✅ Cargar PDFs ya procesados previamente
     processed_hashes = load_processed_pdfs()
-    for info_pdf in paths[:10]:
+    print(f"Numero de archivos encontrados: {len(paths)}")
+    for indice, info_pdf in enumerate(paths[:len(paths)]):
         pdf_path = info_pdf['ruta']
         pdf_filename = os.path.basename(pdf_path)
 
@@ -98,12 +99,14 @@ def read_pdfs_files(folder_pdfs):
             'Total': invoice.get('Total'),
         }, sort_keys=True)
 
+        
         hash_obj = hashlib.sha256(clave_unica.encode()).hexdigest()
 
         if hash_obj in processed_hashes:
             incompletos += 1
             continue
 
+        print(f"{indice}| Ship Date: {invoice['Ship Date']} | Due Date: {invoice['Due Date']} | {invoice['File']}")
          # Agregamos al conjunto de únicos      
         processed_hashes.add(hash_obj)
         
@@ -116,22 +119,16 @@ def read_pdfs_files(folder_pdfs):
         es_arrow_ship_to = 1 if invoice['Ship To'].lower().startswith("arrow") else 0
         invoice['needs_review'] = es_arrow_ship_to
 
-        # print(invoice)
+        ## print(invoice)
         lista_objetos.append(invoice)
 
-        # Mover el original a origin
+        ##Mover el original a origin
         shutil.move(pdf_path, destino_origin)
         remove_invoice_page(destino_origin, destino_attachment)
     
     # ✅ Guardar el registro actualizado
     save_processed_pdfs(processed_hashes)
     return lista_objetos
-
-
-    ####### --- RESUMEN FINAL ---
-    # print(f"Completos: {completos}")
-    # print(f"Duplicados ignorados: {incompletos}")
-    # print(f"Facturas únicas guardadas: {len(lista_objetos)}")
 
 def main_orchestrator(folder_path):
     """
@@ -157,7 +154,7 @@ def main_orchestrator(folder_path):
     print(f"\nIniciando inserción de {len(invoices_to_insert)} factura(s)...")
     with conn: # Usa 'with' para asegurar que la conexión se cierre
         for invoice in invoices_to_insert:
-            result = insert_invoice_with_connection_v2(conn, invoice)
+            result = insert_invoice_with_connection(conn, invoice)
             
             if result['status'] == 'ok':
                 # Si la inserción fue exitosa, confirma los cambios.
